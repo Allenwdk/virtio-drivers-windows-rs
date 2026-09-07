@@ -4,7 +4,7 @@ use core::cell::UnsafeCell;
 use log::{LevelFilter, Log, Metadata, Record, SetLoggerError};
 use spin::Spin;
 use spin::mutex::spin::{SpinMutex, SpinMutexGuard};
-// TODO: aarch64
+#[cfg(target_arch = "x86_64")]
 use uart_16550::SerialPort;
 
 use crossbeam::queue::ArrayQueue;
@@ -98,9 +98,35 @@ impl LogEntry {
     }
 }
 
-const SERIAL_PORT: u16 = 0x3f8;
+#[cfg(target_arch = "x86_64")]
+type LogOutput = SerialPort;
+
+// ARM64 has no x86 I/O ports. Send output to the Windows kernel debugger.
+#[cfg(target_arch = "aarch64")]
+struct LogOutput;
+
+#[cfg(target_arch = "aarch64")]
+impl Write for LogOutput {
+    fn write_str(&mut self, s: &str) -> Result<(), Error> {
+        // DbgPrintEx transmits at most 512 bytes per call. A fixed format also
+        // prevents percent signs in log messages from becoming format strings.
+        for chunk in s.as_bytes().chunks(500) {
+            unsafe {
+                wdk::wdm::DbgPrintEx(
+                    wdk::wdm::_DPFLTR_TYPE::DPFLTR_IHVVIDEO_ID.0 as _,
+                    wdk::wdm::DPFLTR_ERROR_LEVEL,
+                    c"%.*s".as_ptr(),
+                    chunk.len() as core::ffi::c_int,
+                    chunk.as_ptr().cast::<core::ffi::c_char>(),
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 struct Logger {
-    uart: TimeoutMutex<Option<SerialPort>>,
+    uart: TimeoutMutex<Option<LogOutput>>,
     msgs: Option<ArrayQueue<LogEntry>>,
 }
 
@@ -156,8 +182,14 @@ pub fn set_log_level_temp(max_level: LevelFilter) -> LogLevelGuard {
 }*/
 
 pub fn init(max_level: LevelFilter) -> Result<(), SetLoggerError> {
-    let mut uart = unsafe { SerialPort::new(SERIAL_PORT) };
-    uart.init();
+    #[cfg(target_arch = "x86_64")]
+    let uart = {
+        let mut uart = unsafe { SerialPort::new(0x3f8) };
+        uart.init();
+        uart
+    };
+    #[cfg(target_arch = "aarch64")]
+    let uart = LogOutput;
 
     LOGGER.replace(Logger {
         uart: TimeoutMutex::new(Some(uart)),

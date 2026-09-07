@@ -447,6 +447,9 @@ bitflags! {
         const RESOURCE_BLOB         = 1 << 3;
         /// Initializing contexts is supported.
         const CONTEXT_INIT          = 1 << 4;
+        /// DroidVM fixed boot-shared DRM pool descriptor at config offset 16.
+        const DROIDVM_BOOT_POOL     = 1 << 7;
+        const CREATE_GUEST_HANDLE   = 1 << 6;
 
         // device independent
         const NOTIFY_ON_EMPTY       = 1 << 24; // legacy

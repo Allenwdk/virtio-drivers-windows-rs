@@ -3,5 +3,6 @@
 #define _KRPCENV_
 
 #include <intrin.h>
+#include <limits.h>
 #include <wtypes.h>
 #include <dispmprt.h>

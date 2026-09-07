@@ -913,9 +913,9 @@ impl Device {
         self.chan.submit_async(data)
     }
 
-    pub fn context_create_blob(&self, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64) -> Result<(), NtStatus> {
+    pub fn context_create_blob(&self, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64, entry: Option<virtio_drivers::device::gpu::commands::MemEntry>) -> Result<(), NtStatus> {
         let ctx_id = self.context_internal(false).ok_or(STATUS::REINITIALIZATION_NEEDED)?.0;
-        self.chan.resource_create_blob(ctx_id, res_id, blob_id, mem, flags, size)
+        self.chan.resource_create_blob(ctx_id, res_id, blob_id, mem, flags, size, entry)
     }
 
     pub fn context_map_blob(&self, res_id: NonZero<u32>, size: u64) -> Result<(offset_allocator::Allocation, u64, u32), NtStatus> {

@@ -57,6 +57,9 @@ mod command;
 mod virgl;
 mod vidpn;
 mod process;
+mod bringup;
+mod boot_pool;
+mod guest_backing;
 
 // TODO: update tag to invalid for all tagged structs on drop
 pub const VIRTIO_GPU_INVALID_TAG: u64 = 0xDEAD_DEAD_DEAD_DEAD;
@@ -153,6 +156,7 @@ pub unsafe extern "C" fn driver_entry(
     driver: *mut DRIVER_OBJECT,
     registry_path: *mut UNICODE_STRING,
 ) -> NTSTATUS {
+    bringup::record("DriverEntry", 1);
     //logger::init(log::LevelFilter::Trace).unwrap();
     logger::init(log::LevelFilter::Warn).unwrap();
 
@@ -266,6 +270,7 @@ pub unsafe extern "C" fn driver_entry(
     //initial_data.DxgkDdiResetHwEngine = Some(reset_hw_engine);
 
     let status = NtStatus::from(unsafe { DxgkInitialize(driver, registry_path, &mut initial_data) });
+    bringup::record("DxgkInitializeStatus", status.0.to_u32());
 
     if !status.is_success() {
         error!("failed to initialize: {:x?}", status);
@@ -282,6 +287,7 @@ unsafe extern "C" fn unload() {
 }
 
 unsafe extern "C" fn add_device(device: *mut DEVICE_OBJECT, adapter: *mut HANDLE) -> NTSTATUS {
+    bringup::record("AddDevice", 1);
     info!("{}", function!());
     let Some(dev) = NonNull::new(device) else {
         error!("physical device object is null");
@@ -298,6 +304,7 @@ unsafe extern "C" fn add_device(device: *mut DEVICE_OBJECT, adapter: *mut HANDLE
 }
 
 unsafe extern "C" fn remove_device(adapter: HANDLE) -> NTSTATUS {
+    bringup::event("RemoveDevice", 0);
     info!("{}", function!());
 
     if adapter.is_null() {
@@ -311,6 +318,8 @@ unsafe extern "C" fn remove_device(adapter: HANDLE) -> NTSTATUS {
 }
 
 unsafe extern "C" fn start_device(adapter: HANDLE, start_info: *mut DXGK_START_INFO, interface: *mut DXGKRNL_INTERFACE, num_outputs: *mut ULONG, num_children: *mut ULONG) -> NTSTATUS {
+    bringup::event("StartDevice", 0);
+    bringup::record("StartDevice", 1);
     info!("{}", function!());
 
     let gpu = check_handle!(adapter: Adapter);
@@ -321,6 +330,9 @@ unsafe extern "C" fn start_device(adapter: HANDLE, start_info: *mut DXGK_START_I
 
     match gpu.start(start_info, interface) {
         Ok(n_scanouts) => {
+            bringup::event("StartDeviceReturn", 0);
+            bringup::record("StartDeviceStatus", 0);
+            bringup::record("NumScanouts", n_scanouts as u32);
             info!("{}: Detected {} scanouts", function!(), n_scanouts);
 
             *num_outputs  = n_scanouts as _;
@@ -329,6 +341,7 @@ unsafe extern "C" fn start_device(adapter: HANDLE, start_info: *mut DXGK_START_I
             STATUS::SUCCESS
         }
         Err(status) => {
+            bringup::record("StartDeviceStatus", status.0.to_u32());
             error!("{}: failed to start device: {:?}", function!(), status);
             status.0
         },
@@ -338,6 +351,7 @@ unsafe extern "C" fn start_device(adapter: HANDLE, start_info: *mut DXGK_START_I
 }
 
 unsafe extern "C" fn stop_device(adapter: HANDLE) -> NTSTATUS {
+    bringup::event("StopDevice", 0);
     info!("{}", function!());
     let gpu = check_handle!(adapter: Adapter);
 
@@ -376,6 +390,7 @@ unsafe extern "C" fn set_power_state(
 }
 
 unsafe extern "C" fn query_child_relations(adapter: HANDLE, child_relations: *mut DXGK_CHILD_DESCRIPTOR, child_relations_size: ULONG) -> NTSTATUS {
+    bringup::event("QueryChildRelations", child_relations_size);
     trace!("{}: {:?}@{}", function!(), child_relations, child_relations_size);
     let gpu = check_handle!(adapter: Adapter);
 
@@ -403,6 +418,7 @@ unsafe extern "C" fn query_child_relations(adapter: HANDLE, child_relations: *mu
 }
 
 unsafe extern "C" fn query_child_status(adapter: HANDLE, child_status: *mut DXGK_CHILD_STATUS, non_destructive_only: BOOLEAN) -> NTSTATUS {
+    bringup::event("QueryChildStatus", 0);
     info!("{}", function!());
     let gpu = check_handle!(adapter: Adapter);
     let child_status = check_arg!(mut child_status);
@@ -427,6 +443,7 @@ unsafe extern "C" fn query_child_status(adapter: HANDLE, child_status: *mut DXGK
 }
 
 unsafe extern "C" fn query_device_descriptor(adapter: HANDLE, child_uid: ULONG, device_descriptor: *mut DXGK_DEVICE_DESCRIPTOR) -> NTSTATUS {
+    bringup::event("QueryDeviceDescriptor", child_uid);
     trace!("{}", function!());
 
     let gpu = check_handle!(adapter: Adapter);
@@ -487,7 +504,9 @@ unsafe extern "C" fn query_adapter_info(adapter: HANDLE, query_adapter_info: *co
     let gpu = check_handle!(adapter: Adapter);
     let query_info = check_arg!(query_adapter_info);
 
-    match gpu.query_info(query_info) {
+    bringup::event("QueryAdapterInfoType", query_info.Type.0 as u32);
+    bringup::event("QueryAdapterInfoOutputSize", query_info.OutputDataSize);
+    let status = match gpu.query_info(query_info) {
         Ok(()) => {
             //if unsafe { (*query_adapter_info).Type } == DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_QUERYSEGMENT3 {
             //    let segment_info = unsafe { core::mem::transmute::<_, &DXGK_QUERYSEGMENTOUT3>((*query_adapter_info).pOutputData) };
@@ -538,10 +557,13 @@ unsafe extern "C" fn query_adapter_info(adapter: HANDLE, query_adapter_info: *co
             error!("failed to query adapter info: {:?}", status);
             status.0
         },
-    }.to_u32()
+    }.to_u32();
+    bringup::event("QueryAdapterInfoStatus", status);
+    status
 }
 
 unsafe extern "C" fn get_node_metadata(adapter: HANDLE, node_ordinal: UINT, get_node_metadata: *mut DXGKARG_GETNODEMETADATA) -> NTSTATUS {
+    bringup::event("GetNodeMetadata", node_ordinal);
     trace!("{}", function!());
 
     let get_node_metadata = check_arg!(mut get_node_metadata);

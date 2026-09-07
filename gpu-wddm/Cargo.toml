@@ -8,12 +8,15 @@ license.workspace = true
 path = "src/lib.rs"
 crate-type = ["cdylib"]
 
+[features]
+# Persist startup checkpoints for machines without an attached kernel debugger.
+bringup-diagnostics = []
+
 [dependencies]
 bitflags.workspace = true
 crossbeam.workspace = true
 log.workspace = true
 spin.workspace = true
-uart_16550.workspace = true
 virtio-drivers = { path = "../virtio-drivers", features = ["alloc"], default-features = false }
 tagged = { path = "../proc/tagged" }
 wdk = { path = "../wdk" }
@@ -29,6 +32,9 @@ atomicbox.workspace = true
 hashbrown.workspace = true
 modular-bitfield.workspace = true
 itertools.workspace = true
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+uart_16550.workspace = true
 
 [build-dependencies]
 chrono.workspace = true

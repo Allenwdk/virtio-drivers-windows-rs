@@ -229,7 +229,8 @@ pub enum VirtioResource {
         mem: BlobMem,
         flags: BlobFlag,
         info: RwLock<Option<BlobInfo>>,
-        map: RwLock<Option<offset_allocator::Allocation>>,
+        // guest BAR allocator token plus the physical/pool offset used to map it
+        map: RwLock<Option<(offset_allocator::Allocation, u64)>>,
         size: u64,
     },
 }
@@ -460,7 +461,10 @@ impl DeviceSpecificAllocation {
                 VirtioResource::_3D {..} => warn!("{}: 3d resources should have been created by now", function!()),
                 VirtioResource::Blob {id, mem, flags, size, ..} => {
                     debug!("{}: creating blob resource id {} ({})", function!(), alloc.id, id);
-                    device.context_create_blob(alloc.id, id, mem, flags, size)?;
+                    let entry = alloc.guest_backing().map(|b| MemEntry {
+                        addr: b.physical, length: b.size, _padding: 0,
+                    });
+                    device.context_create_blob(alloc.id, id, mem, flags, size, entry)?;
                 }
             }
         }
@@ -570,6 +574,7 @@ pub struct Allocation {
     //create_fence: Pin<Arc<KeEvent>>,
     flags: AtomicU32,
     resource: VirtioResource,
+    guest_backing: Option<Arc<crate::guest_backing::GuestBacking>>,
     busy: (Pin<Arc<KeEvent>>, AtomicUsize),
     sync: RwLock<Vec<NonNull<KeEvent>>>,
     device_specific: SpinMutex<BTreeMap<NonZero<u32>, Weak<DeviceSpecificAllocation>>>,
@@ -590,6 +595,11 @@ fn merge_entries(a: &MemEntry, b: &MemEntry) -> Option<u32> {
 impl Allocation {
     pub fn new<I: Into<VirtioResource>>(id: NonZero<u32>, cmd: Option<AlignedBox<[u8]>>, info: I) -> Result<Self, NtStatus> {
         let resource = info.into();
+        let guest_backing = match &resource {
+            VirtioResource::Blob { mem, size, .. } if mem.contains(BlobMem::GUEST) =>
+                Some(Arc::try_new(crate::guest_backing::GuestBacking::new(*size)?)?),
+            _ => None,
+        };
 
         // Blobs are created later
         let flags = if matches!(resource, VirtioResource::_3D { .. }) {
@@ -604,6 +614,7 @@ impl Allocation {
             //fence,
             flags: AtomicU32::new(flags),
             resource,
+            guest_backing,
             busy: (Arc::pin_init(KeEvent::new(EventType::Notification, false))?, AtomicUsize::new(0)),
             //sync: SpinMutex::new(Vec::new()),
             sync: RwLock::new(Vec::new()),
@@ -611,6 +622,14 @@ impl Allocation {
             device_specific: SpinMutex::new(BTreeMap::new()),
             cmd: SpinMutex::new(cmd),
         })
+    }
+
+    pub fn guest_backing(&self) -> Option<&crate::guest_backing::GuestBacking> {
+        self.guest_backing.as_deref()
+    }
+
+    pub fn retain_guest_backing_on_unref_error(&self) {
+        if let Some(backing) = &self.guest_backing { core::mem::forget(backing.clone()); }
     }
 
     pub fn attached_devices_count(&self) -> usize {
@@ -715,11 +734,26 @@ impl Allocation {
             },
             VirtioResource::Blob { size, map, ..} => {
                 if let Some(map) = *map.read() {
-                    Some((map.offset as u64 * wdk::wdm::PAGE_SIZE as u64, *size))
+                    Some((map.0.offset as u64 * wdk::wdm::PAGE_SIZE as u64, *size))
                 } else {
                     None
                 }
             },
+        }
+    }
+
+    pub fn mapped_physical_offset(&self) -> Option<u64> {
+        match &self.resource {
+            VirtioResource::Blob { map, .. } => map.read().map(|m| m.1),
+            VirtioResource::_3D { .. } => None,
+        }
+    }
+
+    pub fn set_mapped_physical_offset(&self, physical: u64) {
+        if let VirtioResource::Blob { map, .. } = &self.resource {
+            if let Some((_, value)) = map.write().as_mut() {
+                *value = physical;
+            }
         }
     }
 
@@ -741,7 +775,7 @@ impl Allocation {
                         let (offset_alloc, bar_offset, map_info) = device.context_map_blob(self.id, *size)?;
                         // Fuck borrow checker, this is stupid
                         Self::set_flag_mapped(&self.flags, true);
-                        map.write().replace(offset_alloc);
+                        map.write().replace((offset_alloc, bar_offset));
                         Ok((bar_offset, *size, map_info))
                     }
                 } else {
@@ -760,7 +794,7 @@ impl Allocation {
                     unreachable!();
                 },
                 VirtioResource::Blob {map, ..} => {
-                    map.write().take().unwrap()
+                    map.write().take().unwrap().0
                 },
             };
             device.context_unmap_blob(self.id, offset_alloc)

@@ -369,7 +369,9 @@ const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX
     .union(Features::EDID)
     .union(Features::VIRGL)
     .union(Features::RESOURCE_BLOB)
-    .union(Features::CONTEXT_INIT);
+    .union(Features::CONTEXT_INIT)
+    .union(Features::DROIDVM_BOOT_POOL)
+    .union(Features::CREATE_GUEST_HANDLE);
 
 //#[derive(Clone)]
 pub struct DxgkInterface {
@@ -1116,6 +1118,7 @@ impl Adapter {
     }
 
     pub fn start(&mut self, start_info: &DXGK_START_INFO, interface: DXGKRNL_INTERFACE) -> Result<u8, NtStatus> {
+        crate::bringup::record("StartStage", 1);
         trace!("{}", function!());
 
         // TODO: write registry info
@@ -1123,6 +1126,7 @@ impl Adapter {
         //info!("Num dma queue entries = {}, luid = ({}, {})", start_info.RequiredDmaQueueEntry, start_info.AdapterLuid.LowPart, start_info.AdapterLuid.HighPart);
 
         let device_function = self.get_pci_bus_info()?;
+        crate::bringup::record("StartStage", 2);
 
         let interface = DxgkInterface {
             interface: UnsafeCell::new(interface),
@@ -1133,6 +1137,7 @@ impl Adapter {
 
         let device_info = interface.get_device_info()?;
         let pci_common = interface.read_pci_common_header()?;
+        crate::bringup::record("StartStage", 3);
         let luid = unsafe { transmute(start_info.AdapterLuid) };
 
         let mut pci_root = PciRoot::new(interface);
@@ -1154,10 +1159,12 @@ impl Adapter {
         };
 
         let interrupt_flags = self.process_resource_descriptors(full_descriptors, &pci_common)?;
+        crate::bringup::record("StartStage", 4);
 
         info!("vendor id = 0x{:04X}, device id = 0x{:04X}", pci_common.VendorID, pci_common.DeviceID);
 
         let mut pci_transport = map_virtio_pci_error!(PciTransport::new(&mut pci_root, device_function))?;
+        crate::bringup::record("StartStage", 5);
 
         let Some(shmem) = pci_transport.shmem() else {
             error!("no shared memory support");
@@ -1171,7 +1178,20 @@ impl Adapter {
         //
         //info!("size_of::<VirtQueue<DxgkInterface, 256>>(): {}", size_of::<VirtQueue<DxgkInterface, 256>>());
 
+        #[cfg(feature = "bringup-diagnostics")]
+        {
+            crate::bringup::record("BeforeInitStatus", pci_transport.get_status().bits());
+            crate::bringup::record("BeforeInitControlUsed", pci_transport.queue_used(0) as u32);
+            crate::bringup::record("BeforeInitCursorUsed", pci_transport.queue_used(1) as u32);
+        }
         let negotiated_features = pci_transport.begin_init(SUPPORTED_FEATURES);
+        #[cfg(feature = "bringup-diagnostics")]
+        {
+            crate::bringup::record("AfterInitStatus", pci_transport.get_status().bits());
+            crate::bringup::record("AfterInitControlUsed", pci_transport.queue_used(0) as u32);
+            crate::bringup::record("AfterInitCursorUsed", pci_transport.queue_used(1) as u32);
+        }
+        crate::bringup::record("StartStage", 6);
 
         let events_read = map_virtio_error!(read_config!(pci_transport, Config, events_read))?;
         let num_scanouts = map_virtio_error!(read_config!(pci_transport, Config, num_scanouts))? as u8;
@@ -1185,7 +1205,7 @@ impl Adapter {
         let is_vga = pci_common.SubClass as u32 == PCI_SUBCLASS_VID_VGA_CTLR;
         let is_msi = (interrupt_flags as u32 & CM_RESOURCE_INTERRUPT_MESSAGE) != 0;
 
-        pci_transport.finish_init();
+        crate::bringup::record("StartStage", 7);
 
         self.state.write_init(init!(AdapterState {
             luid,
@@ -1204,15 +1224,19 @@ impl Adapter {
         }? NtStatus))?;
 
         let state = self.state.as_mut().unwrap();
+        crate::bringup::record("StartStage", 8);
         state.queue_handler.start_handler_thread()?;
+        crate::bringup::record("StartStage", 9);
         let chan = state.queue_handler.channel();
 
         let (supported_capsets, capset_info) = chan.get_capset_infos(num_capsets)?;
+        crate::bringup::record("StartStage", 10);
 
         state.supported_capsets = supported_capsets;
         state.capset_info = capset_info.map(|i| (i, RwLock::new(None)));
 
         let display_modes = chan.get_display_info()?;
+        crate::bringup::record("StartStage", 11);
 
         let mut rects = [commands::Rect { width: 0, height: 0, x: 0, y: 0}; 16];
         let mut flipq = [const { None }; 16];
@@ -1236,6 +1260,7 @@ impl Adapter {
         }
 
         state.empty_cursor = Some(Cursor::try_new(&chan, 64, 64, 0, 0, 0, 0)?);
+        crate::bringup::record("StartStage", 12);
 
         // TODO: allocate Framebuffer for this
         //if state.system_display_info.is_none() {
@@ -1536,6 +1561,12 @@ impl Adapter {
         let escape_tag = check_buffer_size!(escape.pPrivateDriverData, escape.PrivateDriverDataSize, u64)?;
 
         match *escape_tag {
+            ESCAPE_GUEST_ALLOC_CAPS_TAG => {
+                let caps = check_buffer_size!(escape.pPrivateDriverData, escape.PrivateDriverDataSize, GuestAllocCaps)?;
+                caps.supported = state.negotiated_features.contains(Features::CREATE_GUEST_HANDLE) as u32;
+                caps.alignment = 65536;
+                Ok(())
+            },
             ESCAPE_CAPSET_TAG => {
                 let capset = check_buffer_size!(escape.pPrivateDriverData, escape.PrivateDriverDataSize, Capset)?;
                 trace!("{}: capset: {:?}", function!(), capset);
@@ -1690,9 +1721,17 @@ impl Adapter {
                 };
 
                 let alloc = state.queue_handler.dxgk_interface().allocation_from_handle(blob_map.handle).ok_or(STATUS::INVALID_HANDLE)?;
+                if let Some(backing) = alloc.guest_backing() {
+                    if { blob_map.flags }.contains(BlobMapFlags::UNMAP) {
+                        backing.unmap(unsafe { blob_map.ptr.ptr }.ok_or(STATUS::INVALID_PARAMETER)?)?;
+                    } else {
+                        blob_map.ptr.ptr = Some(backing.map()?);
+                    }
+                    return Ok(());
+                }
                 if { blob_map.flags }.contains(BlobMapFlags::UNMAP) {
                     if let Some(ptr) = unsafe { blob_map.ptr.ptr } && let Some((offset, size)) = alloc.mapped_range() {
-                        let phys = state.queue_handler.get_shmem_slice().0 + offset;
+                        let phys = alloc.mapped_physical_offset().ok_or(STATUS::INVALID_PARAMETER)?;
                         let mdl = MdlOwned::from_io_physical_range(phys, size)?;
                         //debug!("{}: Unmapped {:X} (offset {:X}) from address {:?}: {:?}", function!(), { blob_map.handle }, offset, ptr, alloc);
                         mm_unmap_locked_pages(&mdl, ptr);
@@ -1707,11 +1746,25 @@ impl Adapter {
                     //};
                     alloc.unmap_blob(&device)?;
                 } else {
+                    crate::bringup::record("BlobMapStage", 1);
                     let (offset, size, map_info) = alloc.map_blob(&device)?;
+                    crate::bringup::record("BlobMapStage", 2);
+                    crate::bringup::record("BlobMapInfo", map_info);
+                    crate::bringup::record("BlobMapOffsetLow", offset as u32);
+                    crate::bringup::record("BlobMapSizeLow", size as u32);
 
-                    let phys = state.queue_handler.get_shmem_slice().0 + offset;
+                    const MAP_CACHE_MASK: u32 = 0x0f;
+                    let pool_phys = if map_info & crate::boot_pool::MAP_INFO_POOL != 0 {
+                        let pool = state.queue_handler.boot_pool().ok_or(STATUS::DEVICE_CONFIGURATION_ERROR)?;
+                        let pool_offset = offset;
+                        pool.physical_range(pool_offset, size).ok_or(STATUS::INVALID_PARAMETER)?
+                    } else {
+                        state.queue_handler.get_shmem_slice().0 + offset
+                    };
+                    let cache_map_info = map_info & MAP_CACHE_MASK;
+                    alloc.set_mapped_physical_offset(pool_phys);
 
-                    let caching_type = match map_info {
+                    let caching_type = match cache_map_info {
                         commands::VIRTIO_GPU_MAP_CACHE_NONE => {
                             warn!("{}: map blob returned unexpected caching type VIRTIO_GPU_MAP_CACHE_NONE for {:?}", function!(), &alloc);
                             MEMORY_CACHING_TYPE::MmNonCached
@@ -1731,7 +1784,8 @@ impl Adapter {
                         return Err(NtStatus(STATUS::NOT_IMPLEMENTED));
                     };
 
-                    let mdl = MdlOwned::from_io_physical_range(phys, size)?;
+                    let mdl = MdlOwned::from_io_physical_range(pool_phys, size)?;
+                    crate::bringup::record("BlobMapStage", 3);
 
                     let ptr = match microseh::try_seh(|| -> Option<NonNull<u8>> {
                         mm_map_locked_pages_specify_cache(&mdl, true, wdk::wdm::MEMORY_CACHING_TYPE(caching_type.0), None)
@@ -1750,6 +1804,7 @@ impl Adapter {
                     //let ptr = state.queue_handler.dxgk_interface().map_memory(phys, size, false, true, caching_type)?;
                     debug!("{}: Mapped {:X} (offset {:X}) at address {:?} with caching type {:?}: {:?}", function!(), { blob_map.handle }, offset, ptr, caching_type, alloc);
                     blob_map.ptr.ptr = Some(ptr);
+                    crate::bringup::record("BlobMapStage", 4);
                 }
 
                 Ok(())
@@ -2366,9 +2421,11 @@ impl Adapter {
                     warn!("{}: creating blob {} with no flags will probably fail", function!(), { alloc_blob.id });
                 }
 
-                if { alloc_blob.mem }.contains(BlobMem::GUEST) {
-                    error!("{}: guest blobs are not supported yet", function!());
-                    Err(NtStatus(STATUS::NO_MEMORY))?;
+                if { alloc_blob.mem }.contains(BlobMem::GUEST) &&
+                   (!chan.supports_guest_alloc() ||
+                    { alloc_blob.mem } != BlobMem::HOST3D_GUEST ||
+                    !{ alloc_blob.flags }.contains(BlobFlag::CREATE_GUEST_HANDLE)) {
+                    return Err(NtStatus(STATUS::NOT_SUPPORTED));
                 }
 
                 let resource_id = chan.next_resource_id().ok_or(STATUS::NO_MEMORY)?;
@@ -2486,13 +2543,13 @@ impl Adapter {
                 mm_unmap_locked_pages(&mdl, ptr);
             }*/
 
-            let _ = chan.resource_unmap_blob(id, offset).inspect_err(|e|
+            let _ = chan.resource_unmap_blob(id, offset.0).inspect_err(|e|
                 error!("failed to unmap blob resource {}: {:?}", id, e)
             );
         }
 
         let _ = chan.resource_unref(id).inspect_err(|e|
-            error!("failed to unref resource {}: {:?}", id, e)
+            { alloc.retain_guest_backing_on_unref_error(); error!("failed to unref resource {}: {:?}", id, e); }
         );
     }
 

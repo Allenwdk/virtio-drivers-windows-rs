@@ -648,6 +648,7 @@ bitflags! {
         const MAPPABLE     = 1u32 << 0;
         const SHAREABLE    = 1u32 << 1;
         const CROSS_DEVICE = 1u32 << 2;
+        const CREATE_GUEST_HANDLE = 1u32 << 3;
 
         //const _ = !0;
     }
@@ -1045,3 +1046,7 @@ const _: () = assert!(core::mem::size_of::<CommandHeader>() == 8);
 //const _: () = assert!(core::mem::size_of::<CommandAllocation>() == 4);
 const _: () = assert!(core::mem::size_of::<CommandTransfer>() == 48);
 const _: () = assert!(core::mem::size_of::<SubmitCommand>() == 8);
+
+pub const ESCAPE_GUEST_ALLOC_CAPS_TAG: u64 = u64::from_le_bytes(*b"VESCGCAP");
+#[repr(C)]
+pub struct GuestAllocCaps { pub tag: u64, pub supported: u32, pub alignment: u32 }

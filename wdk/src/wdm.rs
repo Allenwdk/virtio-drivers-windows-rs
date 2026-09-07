@@ -54,6 +54,11 @@ mod sys {
 
     #[link(name = "bufferoverflowfastfailk")]
     unsafe extern "C" {}
+
+    // ARM64 WDK libraries use the kernel CRT's stack cookie push/pop helpers.
+    #[cfg(target_arch = "aarch64")]
+    #[link(name = "libcntpr")]
+    unsafe extern "C" {}
 }
 
 pub use sys::*;

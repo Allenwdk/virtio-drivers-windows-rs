@@ -722,6 +722,12 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
     const OUT_OK: () = assert!(size_of::<MaybeInlineBuffer<OUT>>().is_power_of_two());
 
     pub fn new(pci_transport: &mut PciTransport, access_platform: bool, indirect: bool, event_idx: bool) -> impl Init<Self, NtStatus> {
+        #[cfg(feature = "bringup-diagnostics")]
+        {
+            crate::bringup::record("QueueIndex", Q as u32);
+            crate::bringup::record("QueueUsed", pci_transport.queue_used(Q) as u32);
+            crate::bringup::record("QueueMaxSize", pci_transport.max_queue_size(Q));
+        }
         let _ = Self::IN_OK;
         let _ = Self::OUT_OK;
 
@@ -1504,6 +1510,8 @@ impl FenceSubmission {
 }
 
 struct GpuData {
+    guest_alloc_supported: bool,
+    boot_pool: Option<crate::boot_pool::BootPool>,
     pub interface: DxgkInterface,
     pub shmem: VirtioCapabilityInfo,
 
@@ -1520,10 +1528,12 @@ struct GpuData {
 }
 
 impl GpuData {
-    fn new(interface: DxgkInterface, shmem: VirtioCapabilityInfo) -> impl Init<Self, NtStatus> {
+    fn new(interface: DxgkInterface, shmem: VirtioCapabilityInfo, boot_pool: Option<crate::boot_pool::BootPool>, guest_alloc_supported: bool) -> impl Init<Self, NtStatus> {
         let shmem_pages = (shmem.length / (PAGE_SIZE as u64)) as u32;
 
         init!(Self {
+            guest_alloc_supported,
+            boot_pool,
             interface,
             shmem,
             resource_id: SimpleIdAllocator::new(1),
@@ -1672,6 +1682,8 @@ pub struct GpuChannel {
 }
 
 impl GpuChannel {
+    pub fn supports_guest_alloc(&self) -> bool { self.data.guest_alloc_supported }
+
     fn next_fence(&self) -> u64 {
         self.data.fence.next_fence()
     }
@@ -1917,18 +1929,23 @@ impl GpuChannel {
         )
     }
 
-    pub fn resource_create_blob(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64) -> Result<(), NtStatus> {
+    pub fn resource_create_blob(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64, entry: Option<commands::MemEntry>) -> Result<(), NtStatus> {
         let cmd = commands::ResourceCreateBlob {
             header: self.new_header(commands::Command::RESOURCE_CREATE_BLOB, true, Some(ctx_id), None),
             resource_id: res_id.get(),
             blob_mem: mem.bits(),
             blob_flags: flags.bits(),
-            nr_entries: 0, // We probably don't need guest blobs
+            nr_entries: entry.is_some() as u32,
             blob_id,
             size,
         };
 
-        let resp: commands::CtrlHeader = self.control.request_blocking(cmd)?;
+        #[derive(IntoBytes, Immutable, KnownLayout)]
+        #[repr(C)]
+        struct GuestBlobCommand { cmd: commands::ResourceCreateBlob, entry: commands::MemEntry }
+        let resp: commands::CtrlHeader = if let Some(entry) = entry {
+            self.control.request_blocking(GuestBlobCommand { cmd, entry })?
+        } else { self.control.request_blocking(cmd)? };
         map_virtio_error!(resp.check_type(commands::Command::OK_NODATA)).inspect_err(|_|
             warn!("{}: failed to create resource blob {} ({})", function!(), res_id.get(), blob_id)
         )?;
@@ -1954,7 +1971,10 @@ impl GpuChannel {
             warn!("{}: failed to map blob {}", function!(), res_id.get())
         )?;
 
-        Ok((offset, bar_offset, map_info.map_info))
+        let mapping_offset = crate::boot_pool::mapping_offset(
+            map_info.map_info, map_info._padding, bar_offset,
+        );
+        Ok((offset, mapping_offset, map_info.map_info))
     }
 
     pub fn resource_unmap_blob(&self, id: NonZero<u32>, offset: offset_allocator::Allocation) -> Result<(), NtStatus> {
@@ -2311,18 +2331,43 @@ impl QueueHandler {
         let event_idx = negotiated_features.contains(Features::RING_EVENT_IDX);
 
         init_scope(move || {
+            let boot_pool = if negotiated_features.contains(Features::DROIDVM_BOOT_POOL) {
+                let read_u64 = |offset| crate::boot_pool::read_config_u64(offset, |word_offset| {
+                    pci_transport.read_config_space::<u32>(word_offset)
+                });
+                let magic = map_virtio_error!(read_u64(16))?;
+                let version = map_virtio_error!(pci_transport.read_config_space::<u32>(24))?;
+                let kind = map_virtio_error!(pci_transport.read_config_space::<u32>(28))?;
+                let base = map_virtio_error!(read_u64(32))?;
+                let size = map_virtio_error!(read_u64(40))?;
+                if magic != u64::from_le_bytes(*b"DVMPOOL1") || version != 1 || kind != 1 {
+                    return Err(NtStatus(STATUS::DEVICE_CONFIGURATION_ERROR));
+                }
+                let pool = crate::boot_pool::BootPool::new(base, size)
+                    .ok_or(NtStatus(STATUS::DEVICE_CONFIGURATION_ERROR))?;
+                crate::bringup::record("BootPoolBaseLow", base as u32);
+                crate::bringup::record("BootPoolBaseHigh", (base >> 32) as u32);
+                crate::bringup::record("BootPoolSizeLow", size as u32);
+                Some(pool)
+            } else { None };
             Ok(init!(Self {
                 control <- ControlQueue::new(&mut pci_transport, access_platform, indirect, event_idx),
                 cursor <- CursorQueue::new(&mut pci_transport, access_platform, indirect, event_idx),
                 pci_transport: pci_transport,
                 thread: Box::try_pin_init(Thread::new())?,
-                data: Arc::try_init(GpuData::new(interface, shmem))?,
+                data: Arc::try_init(GpuData::new(interface, shmem, boot_pool, negotiated_features.contains(Features::CREATE_GUEST_HANDLE)))?,
                 chan: GpuChannel {
                     control: control.chan.clone(),
                     cursor: cursor.chan.clone(),
                     data: data.clone(),
                 },
-            }? NtStatus))
+            }? NtStatus).chain(|handler| {
+                // DRIVER_OK lets the host activate the device immediately.
+                // Publish it only after both queues and all fallible state
+                // initialization have completed successfully.
+                handler.pci_transport.finish_init();
+                Ok(())
+            }))
         })
     }
 
@@ -2338,6 +2383,10 @@ impl QueueHandler {
         let phys = self.data.interface.get_physical_bar_address(self.data.shmem.bar).unwrap() + self.data.shmem.offset;
         let size = self.data.shmem.length;
         (phys, size)
+    }
+
+    pub fn boot_pool(&self) -> Option<crate::boot_pool::BootPool> {
+        self.data.boot_pool
     }
 
     pub fn dxgk_interface(&self) -> &DxgkInterface {
