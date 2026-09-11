@@ -387,14 +387,32 @@ impl Command {
             slice_from_raw_parts_mut(addr, n_pages)
         };
 
+        // physical_pages() covers the whole MDL, while this command describes only
+        // the [offset, offset + n_pages) chunk dxgkrnl asked for. Bound the loop by
+        // the entry array: `entries` is a checked slice, so a longer MDL would
+        // otherwise panic in the paging path instead of just sending a short list.
         let phys_pages = &mdl.physical_pages()[offset..];
-        for (i, phys_page) in phys_pages.iter().enumerate() {
+        for (i, phys_page) in phys_pages.iter().take(n_pages).enumerate() {
             entries[i] = commands::MemEntry {
                 addr: phys_page * (PAGE_SIZE as u64),
                 length: PAGE_SIZE,
                 _padding: 0,
             };
         };
+
+        // Which resource each submitted attach names is the discriminator: the
+        // host logs a failure without an id, so pairing guest submissions with
+        // host errors is the only way to tell which resources are rejected.
+        {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static SEQ: AtomicU32 = AtomicU32::new(0);
+            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+            if seq < 8 {
+                crate::bringup::record(&alloc::format!("AttachBuild{seq}_ResId"), res_id.get());
+                crate::bringup::record(&alloc::format!("AttachBuild{seq}_Pages"), n_pages as u32);
+                crate::bringup::record(&alloc::format!("AttachBuild{seq}_MdlPages"), mdl.physical_pages().len() as u32);
+            }
+        }
 
         Command::new(CommandId::MapAperture, None, Flags::empty(), Some(NonNull::from_mut(dma)))
     }
@@ -430,6 +448,18 @@ impl Command {
                 length: PAGE_SIZE,
                 _padding: 0,
             };
+        }
+
+        // Same accounting as the MDL variant; this route serves the framebuffer
+        // and the per-device context buffer, whose attaches appear to succeed.
+        {
+            use core::sync::atomic::{AtomicU32, Ordering};
+            static SEQ_BOX: AtomicU32 = AtomicU32::new(0);
+            let seq = SEQ_BOX.fetch_add(1, Ordering::Relaxed);
+            if seq < 8 {
+                crate::bringup::record(&alloc::format!("AttachBox{seq}_ResId"), res_id.get());
+                crate::bringup::record(&alloc::format!("AttachBox{seq}_Pages"), n_pages as u32);
+            }
         }
 
         Command::new(CommandId::MapAperture, None, Flags::empty(), Some(NonNull::from_mut(dma)))

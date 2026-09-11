@@ -505,6 +505,12 @@ impl<H: Hal, const SIZE: usize> VirtQueue<H, SIZE> {
         self.last_used_idx != unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) }
     }
 
+    /// Returns the driver-consumed and device-produced used indices for diagnostics.
+    pub fn used_indices(&self) -> (u16, u16) {
+        // SAFETY: Same valid used ring and acquire load as `can_pop` above.
+        (self.last_used_idx, unsafe { (*self.used.as_ptr()).idx.load(Ordering::Acquire) })
+    }
+
     /// Returns the descriptor index (a.k.a. token) of the next used element without popping it, or
     /// `None` if the used ring is empty.
     pub fn peek_used(&self) -> Option<u16> {
@@ -1217,6 +1223,37 @@ mod tests {
             VirtQueue::<FakeHal, 4>::new(&mut transport, 0, false, false, false).unwrap_err(),
             Error::AlreadyUsed
         );
+    }
+
+    // cursorq has no device-writable response buffer. Exercise descriptor
+    // recycling and the u16 used/avail wrap while another queue stays pending.
+    #[test]
+    fn input_only_completion_keeps_queues_separate_across_wrap() {
+        let state = Arc::new(Mutex::new(State::new(vec![QueueStatus::default(), QueueStatus::default()], ())));
+        let mut transport = FakeTransport {
+            device_type: DeviceType::GPU, max_queue_size: 16,
+            device_features: 0, state,
+        };
+        let mut control = VirtQueue::<FakeHal, 16>::new(&mut transport, 0, false, false, false).unwrap();
+        let mut cursor = VirtQueue::<FakeHal, 16>::new(&mut transport, 1, false, false, false).unwrap();
+        let control_input = [99u8];
+        let control_token = unsafe { control.add(&[&control_input], &mut []) }.unwrap();
+        for seq in 0u32..65540 {
+            let input = seq.to_le_bytes();
+            let token = unsafe { cursor.add(&[&input], &mut []) }.unwrap();
+            assert!(fake_read_write_queue::<16>(cursor.desc.as_ptr() as _,
+                cursor.avail.as_ptr() as _, cursor.used.as_ptr() as _,
+                |bytes| { assert_eq!(bytes, input); Vec::new() }));
+            assert_eq!(cursor.peek_used(), Some(token));
+            // No response is consumed; the fake device counts input bytes in
+            // used.len, while crosvm returns zero for an input-only chain.
+            unsafe { cursor.pop_used(token, &[&input], &mut []) }.unwrap();
+            assert_eq!(cursor.available_desc(), 16);
+            assert!(!control.can_pop());
+        }
+        assert!(fake_read_write_queue::<16>(control.desc.as_ptr() as _,
+            control.avail.as_ptr() as _, control.used.as_ptr() as _, |_| Vec::new()));
+        unsafe { control.pop_used(control_token, &[&control_input], &mut []) }.unwrap();
     }
 
     #[test]

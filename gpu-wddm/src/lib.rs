@@ -18,6 +18,8 @@ extern crate log;
 
 extern crate alloc;
 
+use crate::bringup::runtime::{self as diag, Stat};
+
 use core::{
     panic::PanicInfo,
     ffi::*,
@@ -478,6 +480,7 @@ unsafe extern "C" fn reset_device(adapter: HANDLE) {
 }
 
 unsafe extern "C" fn interrupt_routine(adapter: HANDLE, message_number: ULONG) -> BOOLEAN {
+    diag::hit(Stat::IrqEnter);
     // Logging here is a bad idea, apparently
     //info!("{}", function!());
 
@@ -485,10 +488,13 @@ unsafe extern "C" fn interrupt_routine(adapter: HANDLE, message_number: ULONG) -
         return false as _;
     };
 
-    gpu.handle_interrupt(message_number) as _
+    let handled = gpu.handle_interrupt(message_number);
+    if handled { diag::hit(Stat::IrqHandled); }
+    handled as _
 }
 
 unsafe extern "C" fn dpc_routine(context: HANDLE) {
+    diag::hit(Stat::DpcEnter);
     //info!("{}", function!());
 
     let Some(gpu): Option<&mut Adapter> = TaggedExt::from_handle_mut(context) else {
@@ -496,6 +502,7 @@ unsafe extern "C" fn dpc_routine(context: HANDLE) {
     };
 
     gpu.handle_dpc();
+    diag::hit(Stat::DpcReturn);
 }
 
 unsafe extern "C" fn query_adapter_info(adapter: HANDLE, query_adapter_info: *const DXGKARG_QUERYADAPTERINFO) -> NTSTATUS {
@@ -503,6 +510,10 @@ unsafe extern "C" fn query_adapter_info(adapter: HANDLE, query_adapter_info: *co
 
     let gpu = check_handle!(adapter: Adapter);
     let query_info = check_arg!(query_adapter_info);
+
+    if query_info.Type == DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_UMDRIVERPRIVATE {
+        diag::publish();
+    }
 
     bringup::event("QueryAdapterInfoType", query_info.Type.0 as u32);
     bringup::event("QueryAdapterInfoOutputSize", query_info.OutputDataSize);
@@ -611,12 +622,15 @@ unsafe extern "C" fn set_pointer_shape(adapter: HANDLE, set_pointer_shape: *cons
 }
 
 unsafe extern "C" fn escape(adapter: HANDLE, escape: *const DXGKARG_ESCAPE) -> NTSTATUS {
+    diag::hit(Stat::EscapeEnter);
     trace!("{}", function!());
 
     let gpu = check_handle!(adapter: Adapter);
     let escape = check_arg!(escape);
 
-    match gpu.escape(escape) {
+    info!("{}: enter device={:?} private_size={}", function!(), escape.hDevice, escape.PrivateDriverDataSize);
+
+    let status = match gpu.escape(escape) {
         Ok(()) => STATUS::SUCCESS,
         Err(NtStatus(STATUS::NOT_SUPPORTED)) => STATUS::NOT_SUPPORTED,
         Err(status) => {
@@ -630,7 +644,9 @@ unsafe extern "C" fn escape(adapter: HANDLE, escape: *const DXGKARG_ESCAPE) -> N
 
             status.0
         },
-    }.to_u32()
+    }.to_u32();
+    diag::hit(Stat::EscapeReturn);
+    status
 }
 
 unsafe extern "C" fn create_allocation(adapter: HANDLE, create_allocation: *mut DXGKARG_CREATEALLOCATION) -> NTSTATUS {
@@ -639,15 +655,52 @@ unsafe extern "C" fn create_allocation(adapter: HANDLE, create_allocation: *mut 
     let gpu = check_handle!(adapter: Adapter);
     let create_allocation = check_arg!(mut create_allocation);
 
+    info!(
+        "{}: DxgkDdiCreateAllocation enter num_allocations={} private_size={}",
+        function!(),
+        create_allocation.NumAllocations,
+        create_allocation.PrivateDriverDataSize,
+    );
+
+    // Running totals: the UMD sees pfnAllocateCb fail while this routine reports
+    // success, so the enter/ok/fail counts are what separate a failure here from
+    // a later dxgkrnl rejection of the returned allocation info.
+    {
+        use core::sync::atomic::AtomicU32;
+        static ENTER: AtomicU32 = AtomicU32::new(0);
+        bringup::count("CreateAllocEnterCount", &ENTER);
+        bringup::record("CreateAllocLastNumAllocations", create_allocation.NumAllocations);
+        bringup::record("CreateAllocLastFlagsResource", create_allocation.Flags.Resource() as u32);
+    }
+
     match gpu.allocate(create_allocation) {
         Ok(()) => {
+            use core::sync::atomic::AtomicU32;
+            static OK: AtomicU32 = AtomicU32::new(0);
+            bringup::count("CreateAllocOkCount", &OK);
             let alloc_info = unsafe { &*create_allocation.pAllocationInfo };
-            debug!("{}: allocation info: {:?}", function!(), alloc_info);
+            info!(
+                "{}: DxgkDdiCreateAllocation success num_allocations={} private_size={} allocation={:?}",
+                function!(),
+                create_allocation.NumAllocations,
+                create_allocation.PrivateDriverDataSize,
+                alloc_info.hAllocation,
+            );
 
             STATUS::SUCCESS
         },
         Err(status) => {
-            error!("failed to allocate: {:?}", status);
+            use core::sync::atomic::AtomicU32;
+            static FAIL: AtomicU32 = AtomicU32::new(0);
+            bringup::count("CreateAllocFailCount", &FAIL);
+            bringup::record("CreateAllocLastFailStatus", status.0.to_u32());
+            error!(
+                "{}: DxgkDdiCreateAllocation failed num_allocations={} private_size={} status={:?}",
+                function!(),
+                create_allocation.NumAllocations,
+                create_allocation.PrivateDriverDataSize,
+                status,
+            );
             status.0
         },
     }.to_u32()
@@ -658,6 +711,12 @@ unsafe extern "C" fn open_allocation(device: HANDLE, open_allocation: *const DXG
     let device = check_handle_arc!(device: Device);
     let open_allocation = check_arg!(open_allocation);
     let allocations = slice_from_raw_parts_mut(open_allocation.pOpenAllocation, open_allocation.NumAllocations as _);
+    use core::sync::atomic::AtomicU32;
+    static OPEN_ENTER: AtomicU32 = AtomicU32::new(0);
+    static OPEN_OK: AtomicU32 = AtomicU32::new(0);
+    static OPEN_FAIL: AtomicU32 = AtomicU32::new(0);
+    bringup::count("OpenAllocEnterCount", &OPEN_ENTER);
+    bringup::record("OpenAllocLastCreate", open_allocation.Flags.Create() as u32);
 
     /*
     if open_allocation.Flags.Create() {
@@ -698,10 +757,13 @@ unsafe extern "C" fn open_allocation(device: HANDLE, open_allocation: *const DXG
     */
         match device.open_allocation(open_allocation.Flags, allocations) {
             Ok(()) => {
+                bringup::count("OpenAllocOkCount", &OPEN_OK);
                 debug!("{}: open allocation succeded!", function!());
                 STATUS::SUCCESS
             },
             Err(status) => {
+                bringup::count("OpenAllocFailCount", &OPEN_FAIL);
+                bringup::record("OpenAllocLastFailStatus", status.0.to_u32());
                 error!("failed to open allocation: {:?}", status);
                 status.0
             },
@@ -907,26 +969,53 @@ unsafe extern "C" fn build_paging_buffer(adapter: HANDLE, build_paging_buffer: *
             let page_offset = map_aperture_segment.MdlOffset as _;
             let n_pages = map_aperture_segment.NumberOfPages as _;
 
-            let needed = Command::attach_backing_dma_len(n_pages);
+            // RESOURCE_ATTACH_BACKING replaces a resource's whole backing and the
+            // host rejects a second attach for the same resource with EINVAL.
+            // A per-call slot (not just "last") is required to tell "one attach
+            // each for two resources" apart from "two attaches for one resource";
+            // the aggregate counters cannot distinguish those.
+            {
+                use core::sync::atomic::{AtomicU32, Ordering};
+                static MAP_ENTER: AtomicU32 = AtomicU32::new(0);
+                let seq = MAP_ENTER.fetch_add(1, Ordering::Relaxed);
+                bringup::record("MapApertureEnterCount", seq + 1);
+                if seq < 8 {
+                    bringup::record(&alloc::format!("MapAperture{seq}_ResId"), res_id.get());
+                    bringup::record(&alloc::format!("MapAperture{seq}_Offset"), page_offset as u32);
+                    bringup::record(&alloc::format!("MapAperture{seq}_Pages"), n_pages as u32);
+                }
+                bringup::record("MapApertureLastSize", alloc.size() as u32);
+                bringup::record("MapApertureLastDmaLen", dmabuf.len() as u32);
+                bringup::record("MapApertureLastAttached", alloc.num_attached_pages() as u32);
+            }
+
+            // A resource can already be backed by the bootstrap scanout buffer.
+            // virglrenderer rejects a second ATTACH_BACKING, so replace that
+            // backing explicitly before installing the MDL supplied by dxgkrnl.
+            // DETACH is also harmless for a resource without prior backing.
+            let detach_len = Command::detach_backing_dma_len();
+            let attach_len = Command::attach_backing_dma_len(n_pages);
+            let needed = detach_len + attach_len;
             if needed >= dmabuf.len() {
+                use core::sync::atomic::AtomicU32;
+                static MAP_SHORT: AtomicU32 = AtomicU32::new(0);
+                bringup::count("MapApertureShortDmaCount", &MAP_SHORT);
+                bringup::record("MapApertureNeededDmaLen", needed as u32);
                 //error!("{}: attaching backing needs {} bytes, but only {} bytes are available", function!(), needed, dmabuf.len());
                 debug!("{}: attaching backing needs {} bytes, but only {} bytes are available", function!(), needed, dmabuf.len());
                 return STATUS::GRAPHICS_INSUFFICIENT_DMA_BUFFER.to_u32();
             }
 
             build_paging_buffer.pDmaBuffer = unsafe { build_paging_buffer.pDmaBuffer.byte_add(needed) };
-            let cmd = Command::attach_backing(&gpu.queue_channel().unwrap(), res_id, mdl, page_offset, n_pages, dmabuf);
+            let chan = gpu.queue_channel().unwrap();
+            let (detach_dma, attach_dma) = dmabuf.split_at_mut(detach_len);
+            let detach = Command::detach_backing(&chan, res_id, detach_dma);
+            let attach = Command::attach_backing(&chan, res_id, mdl, page_offset, n_pages, attach_dma);
 
-            trace!("{} ({:?}): writing {:?} to {:?} (resource {}, n_pages {})", function!(), build_paging_buffer.Operation, cmd, build_paging_buffer.pDmaBufferPrivateData, res_id, n_pages);
+            trace!("{} ({:?}): replacing backing for resource {} (n_pages {})", function!(), build_paging_buffer.Operation, res_id, n_pages);
 
-            if true {
-                dma_priv.commands.push(cmd);
-            } else {
-                build_paging_buffer.pDmaBuffer = dmabuf.as_ptr() as _;
-                if let Err(e) = gpu.queue_channel().unwrap().submit_command_sync(&cmd) {
-                    error!("{} ({:?}): failed to submit: {:?}", function!(), build_paging_buffer.Operation, e);
-                }
-            }
+            dma_priv.commands.push(detach);
+            dma_priv.commands.push(attach);
 
             STATUS::SUCCESS
         },
@@ -1151,16 +1240,35 @@ unsafe extern "C" fn release_swizzling_range(adapter: HANDLE, release_swizzling_
 }*/
 
 unsafe extern "C" fn create_device(adapter: HANDLE, create_device: *mut DXGKARG_CREATEDEVICE) -> NTSTATUS {
+    diag::hit(Stat::CreateDeviceEnter);
     trace!("{}", function!());
 
+    {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        static CREATE_DEVICE_COUNT: AtomicU32 = AtomicU32::new(0);
+        crate::bringup::record("CreateDeviceEnterCount", CREATE_DEVICE_COUNT.fetch_add(1, Ordering::Relaxed) + 1);
+    }
+    info!("{}: enter", function!());
+
     let gpu = check_handle!(adapter: Adapter);
+    crate::bringup::record("CreateDeviceAdapterOk", 1);
 
     let device: Arc<Device> = match Device::new(gpu) {
         Ok(device) => device,
-        Err(code) => return code.to_u32(),
+        Err(code) => {
+            crate::bringup::record("CreateDeviceNewStatus", code.0.into());
+            info!("{}: failed status={:?}", function!(), code);
+            return code.to_u32();
+        },
     };
+    crate::bringup::record("CreateDeviceNewOk", 1);
 
     unsafe { (*create_device).hDevice = TaggedExt::into_arc_handle(device); }
+    crate::bringup::record("CreateDeviceHandleOk", 1);
+
+    info!("{}: success", function!());
+    crate::bringup::record("CreateDeviceSuccess", 1);
+    diag::hit(Stat::CreateDeviceOk);
 
     STATUS::SUCCESS.to_u32()
 }
@@ -1356,18 +1464,22 @@ unsafe extern "C" fn patch(adapter: HANDLE, patch: *const DXGKARG_PATCH) -> NTST
 }
 
 unsafe extern "C" fn submit_command(adapter: HANDLE, submit_command: *const DXGKARG_SUBMITCOMMAND) -> NTSTATUS {
+    diag::hit(Stat::SubmitEnter);
     let gpu = check_handle!(adapter: Adapter);
     let submit_command = check_arg!(submit_command);
 
     trace!("{}: fence {}", function!(), submit_command.SubmissionFenceId);
 
-    match gpu.submit_command(submit_command) {
+    diag::fence(0, submit_command.NodeOrdinal, submit_command.SubmissionFenceId);
+    let status = match gpu.submit_command(submit_command) {
         Ok(()) => STATUS::SUCCESS,
         Err(status) => {
             error!("failed to submit command: {:?}", status);
             status.0
         },
-    }.to_u32()
+    }.to_u32();
+    diag::hit(Stat::SubmitReturn);
+    status
 }
 
 unsafe extern "C" fn is_supported_vidpn(adapter: HANDLE, is_supported_vidpn: *mut DXGKARG_ISSUPPORTEDVIDPN) -> NTSTATUS {
@@ -1810,6 +1922,7 @@ unsafe extern "C" fn check_multiplane_overlay_support2(adapter: HANDLE, check_mu
 }
 
 unsafe extern "C" fn create_process(adapter: HANDLE, create_process: *mut DXGKARG_CREATEPROCESS) -> NTSTATUS {
+    diag::hit(Stat::CreateProcessEnter);
     trace!("{}", function!());
     let gpu = check_handle!(adapter: Adapter);
     let create_process = check_arg!(mut create_process);
@@ -1825,6 +1938,7 @@ unsafe extern "C" fn create_process(adapter: HANDLE, create_process: *mut DXGKAR
     create_process.hKmdProcess = TaggedExt::into_arc_handle(process);
 
     debug!("{}: {:?}", function!(), create_process);
+    diag::hit(Stat::CreateProcessOk);
 
     STATUS::SUCCESS.to_u32()
 }

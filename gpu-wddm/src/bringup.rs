@@ -1,11 +1,90 @@
 //! Opt-in startup diagnostics, readable over SSH after a failed PnP start.
 //! The test installer creates Services\VirtioGpu\Parameters\Bringup first.
 
+/// Runtime checkpoints must also work at DISPATCH_LEVEL and in the ISR.
+/// Capture only atomics there; publish from the private adapter query, which
+/// remains reachable even when device creation is blocked. Snapshot fields
+/// are independent observations, not a transaction across worker threads.
+pub mod runtime {
+    #[derive(Clone, Copy)]
+    pub enum Stat {
+        CreateDeviceEnter, CreateDeviceOk, CreateProcessEnter, CreateProcessOk,
+        EscapeEnter, EscapeReturn, SubmitEnter, SubmitReturn,
+        IrqEnter, IrqHandled, DpcEnter, DpcReturn,
+        ControlWake, ControlResponsesDone, ControlRequestsDone,
+        DmaCompleteEnter, DmaCompleteReturn, NotifyEnter, NotifyReturn,
+        Count,
+    }
+
+    #[cfg(feature = "bringup-diagnostics")]
+    use core::sync::atomic::{AtomicU32, Ordering};
+    #[cfg(feature = "bringup-diagnostics")]
+    static COUNTERS: [AtomicU32; Stat::Count as usize] =
+        [const { AtomicU32::new(0) }; Stat::Count as usize];
+    #[cfg(feature = "bringup-diagnostics")]
+    static FENCES: [[AtomicU32; 64]; 3] =
+        [const { [const { AtomicU32::new(0) }; 64] }; 3];
+
+    #[inline]
+    pub fn hit(stat: Stat) {
+        #[cfg(feature = "bringup-diagnostics")]
+        COUNTERS[stat as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// phase: 0 submitted, 1 response callback, 2 notify returned successfully.
+    #[inline]
+    pub fn fence(phase: usize, node: u32, value: u32) {
+        #[cfg(feature = "bringup-diagnostics")]
+        if let Some(slot) = FENCES.get(phase).and_then(|nodes| nodes.get(node as usize)) {
+            slot.store(value, Ordering::Relaxed);
+        }
+    }
+
+    pub fn publish() {
+        #[cfg(feature = "bringup-diagnostics")]
+        {
+            if unsafe { wdk::wdm::KeGetCurrentIrql() } != 0 { return; }
+            const NAMES: [&str; Stat::Count as usize] = [
+                "RtCreateDeviceEnter", "RtCreateDeviceOk", "RtCreateProcessEnter", "RtCreateProcessOk",
+                "RtEscapeEnter", "RtEscapeReturn", "RtSubmitEnter", "RtSubmitReturn",
+                "RtIrqEnter", "RtIrqHandled", "RtDpcEnter", "RtDpcReturn",
+                "RtControlWake", "RtControlResponsesDone", "RtControlRequestsDone",
+                "RtDmaCompleteEnter", "RtDmaCompleteReturn", "RtNotifyEnter", "RtNotifyReturn",
+            ];
+            super::record("RuntimeDiagnosticsRevision", 61);
+            for (name, counter) in NAMES.iter().zip(COUNTERS.iter()) {
+                super::record(name, counter.load(Ordering::Relaxed));
+            }
+            for node in 0..64 {
+                let values = core::array::from_fn::<_, 3, _>(|phase| FENCES[phase][node].load(Ordering::Relaxed));
+                if values.iter().any(|&v| v != 0) {
+                    for (phase, value) in values.iter().enumerate() {
+                        super::record(&alloc::format!("RtFence{node:02}_{}", ["Submit", "Response", "Notify"][phase]), *value);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(not(feature = "bringup-diagnostics"))]
 pub fn record(_name: &str, _value: u32) {}
 
 #[cfg(not(feature = "bringup-diagnostics"))]
 pub fn event(_name: &str, _value: u32) {}
+
+#[cfg(not(feature = "bringup-diagnostics"))]
+pub fn count(_name: &str, _counter: &core::sync::atomic::AtomicU32) {}
+
+/// Publish a running total instead of a flag. `record` overwrites, so a repeated
+/// call site cannot be told apart from a single one; the allocation paths need
+/// the distinction to attribute a failure to this driver or to dxgkrnl.
+#[cfg(feature = "bringup-diagnostics")]
+pub fn count(name: &str, counter: &core::sync::atomic::AtomicU32) {
+    use core::sync::atomic::Ordering;
+    let value = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    record(name, value);
+}
 
 /// Preserve callback order without unbounded registry growth. These diagnostics
 /// deliberately skip callbacks above PASSIVE_LEVEL, like `record` does.

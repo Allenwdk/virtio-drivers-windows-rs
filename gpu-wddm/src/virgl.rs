@@ -1288,22 +1288,9 @@ impl VirglResourceSetType {
     }
 }
 
-#[repr(C)]
-#[derive(PartialEq, Eq, Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
-pub struct VirglResourceLayoutPlane {
-    pub offset: u64,
-    pub stride: u32,
-    pub size: u32,
-}
-
-#[repr(C)]
-#[derive(PartialEq, Eq, Clone, Copy, Debug, FromBytes, IntoBytes, Immutable)]
-pub struct VirglResourceLayout {
-    pub modifier: u64,
-    pub num_planes: u32,
-    pub reserved: u32,
-    pub planes: [VirglResourceLayoutPlane; 4],
-}
+#[path = "resource_layout.rs"]
+mod resource_layout;
+pub use resource_layout::{VirglResourceLayout, VirglResourceLayoutPlane};
 
 #[repr(transparent)]
 #[derive(PartialEq, Eq, Clone, Copy, IntoBytes, Immutable)]

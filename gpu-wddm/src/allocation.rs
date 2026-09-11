@@ -461,10 +461,8 @@ impl DeviceSpecificAllocation {
                 VirtioResource::_3D {..} => warn!("{}: 3d resources should have been created by now", function!()),
                 VirtioResource::Blob {id, mem, flags, size, ..} => {
                     debug!("{}: creating blob resource id {} ({})", function!(), alloc.id, id);
-                    let entry = alloc.guest_backing().map(|b| MemEntry {
-                        addr: b.physical, length: b.size, _padding: 0,
-                    });
-                    device.context_create_blob(alloc.id, id, mem, flags, size, entry)?;
+                    let entries = alloc.guest_backing().map(|b| b.entries()).unwrap_or(&[]);
+                    device.context_create_blob(alloc.id, id, mem, flags, size, entries)?;
                 }
             }
         }
@@ -626,6 +624,10 @@ impl Allocation {
 
     pub fn guest_backing(&self) -> Option<&crate::guest_backing::GuestBacking> {
         self.guest_backing.as_deref()
+    }
+
+    pub fn guest_backing_owner(&self) -> Option<Arc<crate::guest_backing::GuestBacking>> {
+        self.guest_backing.clone()
     }
 
     pub fn retain_guest_backing_on_unref_error(&self) {

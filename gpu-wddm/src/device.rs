@@ -81,7 +81,8 @@ impl Context3D {
 
 struct QueryBuffer {
     id: NonZero<u32>,
-    buf: AlignedBox<[u8]>,
+    buf: core::mem::ManuallyDrop<AlignedBox<[u8]>>,
+    chan: GpuChannel,
 }
 
 impl QueryBuffer {
@@ -101,26 +102,31 @@ impl QueryBuffer {
             size: PAGE_SIZE as _,
         };
 
-        let id = device.chan.resource_create_3d(&alloc_3d)?;
         let buf = Box::<[u8], _>::try_new_zeroed_slice_in(alloc_3d.size as usize, AlignedAlloc)?;
         let buf = unsafe { buf.assume_init() };
 
         let ctx_id = device.context_virgl().ok_or(STATUS::REINITIALIZATION_NEEDED)?.0;
 
+        let id = device.chan.resource_create_3d(&alloc_3d)?;
+        let query = Self { id, buf: core::mem::ManuallyDrop::new(buf), chan: device.chan.clone() };
         device.chan.context_attach_resource(ctx_id, id)?;
 
         let mut cmd_data = [0u8; size_of::<commands::ResourceAttachBacking>() + size_of::<commands::MemEntry>()];
         assert_eq!(Command::attach_backing_dma_len(1), size_of_val(&cmd_data));
 
-        let cmd = Command::attach_backing_box(&device.chan, id, &buf, &mut cmd_data);
+        let cmd = Command::attach_backing_box(&device.chan, id, &query.buf, &mut cmd_data);
         device.chan.submit_command_sync(&cmd)?;
 
-        // TODO: this should be stored as owned DeviceSpecific allocation
+        Ok(query)
+    }
+}
 
-        Ok(Self {
-            id,
-            buf,
-        })
+impl Drop for QueryBuffer {
+    fn drop(&mut self) {
+        let buf = unsafe { core::mem::ManuallyDrop::take(&mut self.buf) };
+        if let Err(e) = self.chan.resource_unref_backing(self.id, ResourceBacking::Query(buf)) {
+            error!("query buffer unref failed: {:?}", e);
+        }
     }
 }
 
@@ -155,13 +161,17 @@ impl fmt::Debug for Device {
 
 impl Device {
     pub fn new(parent: &Adapter) -> Result<Arc<Self>, NtStatus> {
+        crate::bringup::record("DeviceNewEnter", 1);
         Ok(Arc::try_new(Self {
             tag: VIRTIO_GPU_DEVICE_TAG,
             chan: parent.queue_channel().ok_or(STATUS::REINITIALIZATION_NEEDED)?,
             main_context: RwLock::new(None),
             virgl_blit_context: RwLock::new(None),
             query_buffer: SpinMutex::new(None),
-        })?)
+        })?).map(|device| {
+            crate::bringup::record("DeviceNewOk", 1);
+            device
+        })
     }
 
     pub fn dxgk_context(self: &Arc<Self>, engine: Engine) -> Result<Arc<DeviceContext>, NtStatus> {
@@ -269,6 +279,12 @@ impl Device {
 
         let layout = VirglResourceLayout::read_from_prefix(query.buf.as_ref()).unwrap().0;
 
+        if !layout.is_valid() {
+            crate::bringup::record("QueryLayoutInvalidPlanes", layout.num_planes);
+            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        }
+        crate::bringup::record("QueryLayoutOkPlanes", layout.num_planes);
+        crate::bringup::record("QueryLayoutOkStride", layout.planes[0].stride);
         debug!("{}: resource layout: {:?}", function!(), layout);
         Ok(layout)
     }
@@ -913,9 +929,9 @@ impl Device {
         self.chan.submit_async(data)
     }
 
-    pub fn context_create_blob(&self, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64, entry: Option<virtio_drivers::device::gpu::commands::MemEntry>) -> Result<(), NtStatus> {
+    pub fn context_create_blob(&self, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64, entries: &[virtio_drivers::device::gpu::commands::MemEntry]) -> Result<(), NtStatus> {
         let ctx_id = self.context_internal(false).ok_or(STATUS::REINITIALIZATION_NEEDED)?.0;
-        self.chan.resource_create_blob(ctx_id, res_id, blob_id, mem, flags, size, entry)
+        self.chan.resource_create_blob(ctx_id, res_id, blob_id, mem, flags, size, entries)
     }
 
     pub fn context_map_blob(&self, res_id: NonZero<u32>, size: u64) -> Result<(offset_allocator::Allocation, u64, u32), NtStatus> {
@@ -932,21 +948,9 @@ impl Drop for Device {
     fn drop(&mut self) {
         self.tag = 0;
 
-        if let Some(query) = self.query_buffer.get_mut() {
-            let _ = self.chan.resource_detach_backing(query.id).inspect_err(|e|
-               error!("{}: failed to detach backing from resource: {:?}", function!(), e)
-            );
-
-            if let Some(blit) = self.virgl_blit_context.get_mut() {
-                let _ = self.chan.context_detach_resource(blit.id, query.id).inspect_err(|e|
-                   error!("{}: failed to detach resource from context: {:?}", function!(), e)
-                );
-            }
-
-            let _ = self.chan.resource_unref(query.id).inspect_err(|e|
-               error!("{}: failed to unref resource: {:?}", function!(), e)
-            );
-        }
+        // The queued UNREF retains the backing through its response, including
+        // setup failure and timeout paths. Host UNREF detaches all contexts.
+        drop(self.query_buffer.get_mut().take());
 
         if let Some(main) = self.main_context.get_mut() {
             debug!("Destroying context {:?}", main);

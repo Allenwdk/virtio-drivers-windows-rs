@@ -59,6 +59,7 @@ use crossbeam::{
 };
 use winresult::STATUS;
 use virtio_drivers::{
+    Dma,
     config::*,
     device::{
         gpu::*,
@@ -84,6 +85,7 @@ use spin::{
 };
 
 use crate::adapter::*;
+use crate::bringup::runtime::{self as diag, Stat};
 use crate::uapi::*;
 use crate::allocation::*;
 use crate::command::{*, Command};
@@ -237,12 +239,18 @@ impl Drop for AllocationsBatch {
     }
 }
 
+pub enum ResourceBacking {
+    Guest(Arc<crate::guest_backing::GuestBacking>),
+    Query(AlignedBox<[u8]>),
+}
+
 enum Callback<const MAX_INLINE: usize> {
     None,
     SetEvent(BlockingBuffer<MaybeInlineBuffer<MAX_INLINE>>),
     //SetEvent(NonNull<KeEvent>, Option<NonNull<MaybeUninit<MaybeInlineBuffer<MAX_INLINE>>>>, CancellationSignal),
     FreeContextId(NonZero<u32>),
     FreeResourceId(NonZero<u32>),
+    FreeResourceBacking(NonZero<u32>, ManuallyDrop<ResourceBacking>),
     DmaCompleted(Engine, u32),
     DmaCompletedWithAllocations(Engine, u32, AllocationsBatch),
     DmaCompletedBatched(Engine, u32, Arc<AllocationsBatch>),
@@ -326,6 +334,10 @@ enum MaybeInlineBuffer<const MAX_INLINE: usize> {
     },
     Dma {
         data: NonNull<[u8]>,
+    },
+    OwnedDma {
+        allocation: Arc<Dma<DxgkInterface>>,
+        len: usize,
     },
     // TODO: find an efficient way to submit guest-only allocations as buffers
     //IoVec {
@@ -442,6 +454,11 @@ impl<const MAX_INLINE: usize> MaybeInlineBuffer<MAX_INLINE> {
 
     fn as_mut(&mut self) -> &mut [u8] {
         match self {
+            MaybeInlineBuffer::OwnedDma { allocation, len } => {
+                // Only used for an owned input before it is submitted. The
+                // Arc keeps it allocated while a cancelled request is pending.
+                unsafe { &mut allocation.raw_slice().as_mut()[..*len] }
+            },
             MaybeInlineBuffer::Inline {len, data, ..} => {
                 let len = *len as usize;
                 &mut data[0..len]
@@ -460,6 +477,9 @@ impl<const MAX_INLINE: usize> MaybeInlineBuffer<MAX_INLINE> {
 
     fn as_ref(&self) -> &[u8] {
         match self {
+            MaybeInlineBuffer::OwnedDma { allocation, len } => {
+                unsafe { &allocation.raw_slice().as_ref()[..*len] }
+            },
             MaybeInlineBuffer::Inline {len, data, ..} => {
                 let len = *len as usize;
                 &data[0..len]
@@ -603,6 +623,7 @@ struct Queue<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize
     queue: VirtQueue<DxgkInterface, SIZE>,
     buffers: Buffers<SIZE, IN, OUT>,
     free: ArrayQueue<usize>,
+    response_error_reported: bool,
     //nop: SegQueue<u32>,
 
     //chan: Pin<Arc<AsyncQueue<Buffer<IN, OUT>>>>,
@@ -756,6 +777,7 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
             //slow: SegQueue::new(),
             //nop: SegQueue::new(),
             free <- init_free,
+            response_error_reported: false,
             //last_submitted_fence: AtomicU64::new(0),
         }? NtStatus)
     }
@@ -763,8 +785,8 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
     fn push_to_device(&mut self, pci_transport: &mut PciTransport, i: usize, buffer: Buffer<IN, OUT>) -> Result<(), NtStatus> {
         //trace!("{}", function!());
 
-        let input_is_dma = matches!(buffer.input, MaybeInlineBuffer::Dma{..});
-        let output_is_dma = matches!(buffer.output, MaybeInlineBuffer::Dma{..});
+        let input_is_dma = matches!(buffer.input, MaybeInlineBuffer::Dma{..} | MaybeInlineBuffer::OwnedDma{..});
+        let output_is_dma = matches!(buffer.output, MaybeInlineBuffer::Dma{..} | MaybeInlineBuffer::OwnedDma{..});
 
         // DEBUG
         if false {
@@ -871,7 +893,14 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
         }
 
         //trace!("{}: sending buffer to device", function!());
-        let token = map_virtio_error!(unsafe { self.queue.add(&[input], &mut [output]) })?;
+        // cursorq is a no-response queue (as in Linux virtgpu_queue_cursor).
+        // Its completion belongs to cursorq itself, never the control queue's
+        // renderer fence callback. Keep the scratch output entirely private.
+        let token = if Q == QUEUE_CURSOR {
+            map_virtio_error!(unsafe { self.queue.add(&[input], &mut []) })?
+        } else {
+            map_virtio_error!(unsafe { self.queue.add(&[input], &mut [output]) })?
+        };
         self.buffers.indices[token as usize] = Some(i);
 
         if self.queue.should_notify() {
@@ -889,12 +918,17 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
             return Ok(None);
         };
 
-        let i = self.buffers.indices[token as usize].ok_or(STATUS::INVALID_DEVICE_STATE)?;
+        let i = self.buffers.indices.get(token as usize).copied().flatten()
+            .ok_or(STATUS::INVALID_DEVICE_STATE)?;
 
         let input = self.buffers.inputs[i].as_ref().ok_or(STATUS::INVALID_DEVICE_STATE)?.as_ref();
         let output = self.buffers.outputs[i].as_mut().ok_or(STATUS::INVALID_DEVICE_STATE)?.as_mut();
 
-        let len = map_virtio_error!(unsafe { self.queue.pop_used(token, &[input], &mut [output]) })?;
+        let len = if Q == QUEUE_CURSOR {
+            map_virtio_error!(unsafe { self.queue.pop_used(token, &[input], &mut []) })?
+        } else {
+            map_virtio_error!(unsafe { self.queue.pop_used(token, &[input], &mut [output]) })?
+        };
 
         self.buffers.indices[token as usize] = None;
 
@@ -1008,6 +1042,13 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
         //trace!("response: device wrote {} bytes into buffer {}", len, i);
 
         let callback = take(&mut self.buffers.callbacks[i]);
+        if Q == QUEUE_CURSOR {
+            // No CtrlHeader was returned and there is no GPU fence to signal.
+            // move_cursor/update_cursor only use Callback::None.
+            debug_assert!(matches!(callback, Callback::None));
+            self.mark_free(i);
+            return Ok(Some(()));
+        }
 
         /*
         if let Some((Engine::Other(_), fence)) = callback.as_dma_completed() {
@@ -1056,6 +1097,24 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
                 self.mark_free(i);
             },
 
+            Callback::FreeResourceBacking(id, mut backing) => {
+                let valid = len as usize >= size_of::<commands::CtrlHeader>() &&
+                    self.buffers.outputs[i].as_ref().and_then(|out|
+                        commands::CtrlHeader::read_from_prefix(out.as_ref()).ok()
+                    ).map(|(hdr, _)| hdr.hdr_type == commands::Command::OK_NODATA)
+                    .unwrap_or(false);
+                if valid {
+                    data.resource_id.free(id.get());
+                    unsafe { ManuallyDrop::drop(&mut backing); }
+                    crate::bringup::record("BackingUnrefLastOk", id.get());
+                } else {
+                    // No proof the host stopped accessing these pages. The
+                    // ManuallyDrop also retains them if the queue is dropped.
+                    crate::bringup::record("BackingUnrefRetained", id.get());
+                }
+                self.mark_free(i);
+            },
+
             Callback::FreeContextId(id) => {
                 data.context_id.free(id.get());
                 self.mark_free(i);
@@ -1094,10 +1153,32 @@ impl<const Q: u16, const SIZE: usize, const FAST: usize, const IN: usize, const 
         loop {
             match self.response(data) {
                 Ok(None) => return,
-                Ok(Some(())) => continue,
+                Ok(Some(())) => { self.response_error_reported = false; continue; },
                 Err(e) => {
-                    error!("{}: failed to handle response: {:?}", function!(), e);
-                    continue
+                    // pop_from_device failed before advancing the used ring.
+                    // Retrying here cannot make progress: it starves the other
+                    // queues, stop event and timeout processing on this worker.
+                    // Preserve descriptor ownership; do not invent a completion
+                    // or recycle buffers that the device might still access.
+                    if !self.response_error_reported {
+                        self.response_error_reported = true;
+                        let (consumed, produced) = self.queue.used_indices();
+                        let token = self.queue.peek_used();
+                        let slot = token.and_then(|t| self.buffers.indices.get(t as usize).copied().flatten());
+                        let input_present = slot.and_then(|i| self.buffers.inputs.get(i)).is_some_and(Option::is_some);
+                        let output_present = slot.and_then(|i| self.buffers.outputs.get(i)).is_some_and(Option::is_some);
+                        crate::bringup::record("QueueResponseErrorQueue", Q as u32);
+                        crate::bringup::record("QueueResponseErrorStatus", e.0.to_u32());
+                        crate::bringup::record("QueueResponseErrorConsumed", consumed as u32);
+                        crate::bringup::record("QueueResponseErrorProduced", produced as u32);
+                        crate::bringup::record("QueueResponseErrorToken", token.map(u32::from).unwrap_or(u32::MAX));
+                        crate::bringup::record("QueueResponseErrorSlot", slot.map(|i| i as u32).unwrap_or(u32::MAX));
+                        crate::bringup::record("QueueResponseErrorInput", input_present as u32);
+                        crate::bringup::record("QueueResponseErrorOutput", output_present as u32);
+                        error!("{}: queue={} status={:?} used={}/{} token={:?} slot={:?} input={} output={}; stopping this response pass",
+                            function!(), Q, e, consumed, produced, token, slot, input_present, output_present);
+                    }
+                    return;
                 },
             };
         }
@@ -1572,9 +1653,12 @@ impl GpuData {
     }
 
     fn notify_dma_completed(&self, engine: Engine, fence: u32) {
+        diag::hit(Stat::DmaCompleteEnter);
+        diag::fence(1, engine.node_ordinal(), fence);
         self.notify_fence(engine, fence, &|engine, fence| {
             let _ = self.interface.notify_interrupt_synchronized(Interrupt::DmaCompleted(engine, fence));
         });
+        diag::hit(Stat::DmaCompleteReturn);
     }
 
     fn notify_dma_faulted(&self, engine: Engine, fence: u32) {
@@ -1896,7 +1980,20 @@ impl GpuChannel {
             _padding: 0,
         };
 
-        let resp: commands::CtrlHeader = self.control.request_blocking(cmd)?;
+        let resp: commands::CtrlHeader = match self.control.request_blocking(cmd) {
+            Ok(resp) => resp,
+            Err(status) => {
+                error!(
+                    "{}: RESOURCE_CREATE_3D control request failed id={} status={:?}",
+                    function!(), resource_id, status
+                );
+                return Err(status);
+            }
+        };
+        info!(
+            "{}: RESOURCE_CREATE_3D response id={} type={:?}",
+            function!(), resource_id, resp.hdr_type
+        );
         map_virtio_error!(resp.check_type(commands::Command::OK_NODATA)).inspect_err(|_| {
             warn!("{}: failed to create resource 3d {}", function!(), resource_id.get());
             self.data.resource_id.free(resource_id.get())
@@ -1929,23 +2026,21 @@ impl GpuChannel {
         )
     }
 
-    pub fn resource_create_blob(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64, entry: Option<commands::MemEntry>) -> Result<(), NtStatus> {
+    pub fn resource_create_blob(&self, ctx_id: NonZero<u32>, res_id: NonZero<u32>, blob_id: u64, mem: BlobMem, flags: BlobFlag, size: u64, entries: &[commands::MemEntry]) -> Result<(), NtStatus> {
         let cmd = commands::ResourceCreateBlob {
             header: self.new_header(commands::Command::RESOURCE_CREATE_BLOB, true, Some(ctx_id), None),
             resource_id: res_id.get(),
             blob_mem: mem.bits(),
             blob_flags: flags.bits(),
-            nr_entries: entry.is_some() as u32,
+            nr_entries: entries.len() as u32,
             blob_id,
             size,
         };
 
-        #[derive(IntoBytes, Immutable, KnownLayout)]
-        #[repr(C)]
-        struct GuestBlobCommand { cmd: commands::ResourceCreateBlob, entry: commands::MemEntry }
-        let resp: commands::CtrlHeader = if let Some(entry) = entry {
-            self.control.request_blocking(GuestBlobCommand { cmd, entry })?
-        } else { self.control.request_blocking(cmd)? };
+        let input = MaybeInlineBuffer::try_from_hdr_with_body(cmd, entries.as_bytes())?;
+        let output = MaybeInlineBuffer::try_new_zeroed::<commands::CtrlHeader>()?;
+        let response = self.control.request_blocking_buf(input, output, DEFAULT_BLOCKING_TIMEOUT)?;
+        let resp = commands::CtrlHeader::read_from_prefix(response.as_ref()).unwrap().0;
         map_virtio_error!(resp.check_type(commands::Command::OK_NODATA)).inspect_err(|_|
             warn!("{}: failed to create resource blob {} ({})", function!(), res_id.get(), blob_id)
         )?;
@@ -2047,6 +2142,17 @@ impl GpuChannel {
         Ok(())
     }
 
+    pub fn resource_unref_backing(&self, id: NonZero<u32>, backing: ResourceBacking) -> Result<(), NtStatus> {
+        let cmd = commands::ResourceUnref {
+            header: self.new_header(commands::Command::RESOURCE_UNREF, true, None, None),
+            resource_id: id.get(), _padding: 0,
+        };
+        // Own before any fallible buffer allocation: failure must retain the
+        // storage because the host might still hold the resource.
+        let callback = Callback::FreeResourceBacking(id, ManuallyDrop::new(backing));
+        self.control.request_async::<_, commands::CtrlHeader>(cmd, callback)
+    }
+
     pub fn submit_async(&self, data: AlignedBox<[u8]>) -> Result<(), NtStatus> {
         let input = MaybeInlineBuffer::Boxed { data };
         let output = MaybeInlineBuffer::try_new_zeroed::<commands::CtrlHeader>()?;
@@ -2061,17 +2167,32 @@ impl GpuChannel {
             error!("{}: failed to get dma from command {:?}. Does it still needs patching?", function!(), cmd)
         )?;
 
-        let input = MaybeInlineBuffer::Dma { data: dma };
+        // The caller can pass a stack-backed command (query_layout does).
+        // A timeout cancels only the waiter, not the device's descriptor.
+        // Copy into queue-owned storage so the input survives until pop_used,
+        // even when the caller has already returned from the timed-out wait.
+        let mut input = if dma.len() <= PAGE_SIZE {
+            MaybeInlineBuffer::try_new_zeroed_size(dma.len())?
+        } else {
+            // Framebuffer backing lists may span several pages. They also
+            // need an owner after timeout and a physically contiguous input.
+            MaybeInlineBuffer::OwnedDma {
+                allocation: Arc::try_new(Dma::<DxgkInterface>::new(
+                    dma.len().div_ceil(PAGE_SIZE), BufferDirection::DriverToDevice, false,
+                )?)?,
+                len: dma.len(),
+            }
+        };
+        input.as_mut().copy_from_slice(unsafe { dma.as_ref() });
         let output = MaybeInlineBuffer::try_new_zeroed::<commands::CtrlHeader>()?;
-        //let output = if cmd.id == CommandId::MapBlob {
-        //    MaybeInlineBuffer::try_new_zeroed::<commands::RespMapInfo>()?
-        //} else {
-        //    MaybeInlineBuffer::try_new_zeroed::<commands::CtrlHeader>()?
-        //};
-
-        self.control.request_blocking_buf(input, output, DEFAULT_BLOCKING_TIMEOUT)?;
-
-        Ok(())
+        let response = self.control.request_blocking_buf(input, output, DEFAULT_BLOCKING_TIMEOUT)?;
+        let resp = commands::CtrlHeader::read_from_prefix(response.as_ref()).unwrap().0;
+        // An error response completes the transport request, but does not
+        // mean that the layout query succeeded or populated its output buffer.
+        map_virtio_error!(resp.check_type(commands::Command::OK_NODATA)).inspect_err(|status| {
+            crate::bringup::record("SyncSubmitHostError", status.0.to_u32());
+            error!("{}: synchronous command failed: {:?}", function!(), resp);
+        })
     }
 
     pub fn submit_fence(&self, engine: Engine, dxgk_fence: u32, virtio_fence: u64) {
@@ -2103,6 +2224,14 @@ impl GpuChannel {
 
         debug!("{}: Sending async dma command: {:?}", function!(), cmd);
 
+        // Same accounting as the batch path: an attach can also be submitted on
+        // its own, so both routes must be counted to compare against the host.
+        if cmd.id == CommandId::MapAperture {
+            use core::sync::atomic::AtomicU32;
+            static SUBMITTED_SINGLE: AtomicU32 = AtomicU32::new(0);
+            crate::bringup::count("AttachSubmittedSingleCount", &SUBMITTED_SINGLE);
+        }
+
         let dma = cmd.dma().ok_or(STATUS::UNSUCCESSFUL).inspect_err(|e|
             error!("{}: failed to get dma from command {:?}. Does it still needs patching?", function!(), cmd)
         )?;
@@ -2125,6 +2254,16 @@ impl GpuChannel {
         let allocations = Arc::new(allocations);
         for (i, cmd) in cmds.iter().enumerate() {
             assert!(cmd.id != CommandId::Nop);
+            // Count what actually reaches the ring. A paging buffer accumulates
+            // commands in its private data and one submit can carry several, so
+            // the number of MAP_APERTURE_SEGMENT calls is not the number of
+            // RESOURCE_ATTACH_BACKING commands the host sees.
+            if cmd.id == CommandId::MapAperture {
+                use core::sync::atomic::AtomicU32;
+                static SUBMITTED: AtomicU32 = AtomicU32::new(0);
+                crate::bringup::count("AttachSubmittedCount", &SUBMITTED);
+                crate::bringup::record("AttachSubmittedBatchLen", cmds.len() as u32);
+            }
             let dma = cmd.dma().unwrap();
             debug!("{}: Sending async dma command batch ({}): {:?}", function!(), Arc::strong_count(&allocations), cmd);
             //if cmd.id == CommandId::MapBlob {
@@ -2250,7 +2389,7 @@ impl GpuChannel {
 
     pub fn move_cursor(&self, scanout_id: u32, x: u32, y: u32) -> Result<(), NtStatus> {
         let cmd = commands::UpdateCursor {
-            header: self.new_header(commands::Command::MOVE_CURSOR, true, None, None),
+            header: self.new_header(commands::Command::MOVE_CURSOR, false, None, None),
             pos: commands::CursorPos {
                 scanout_id,
                 x,
@@ -2280,7 +2419,7 @@ impl GpuChannel {
 
     pub fn update_cursor(&self, scanout_id: u32, resource_id: NonZero<u32>, hot_x: u32, hot_y: u32, x: u32, y: u32) -> Result<(), NtStatus> {
         let cmd = commands::UpdateCursor {
-            header: self.new_header(commands::Command::UPDATE_CURSOR, true, None, None),
+            header: self.new_header(commands::Command::UPDATE_CURSOR, false, None, None),
             pos: commands::CursorPos {
                 scanout_id,
                 x,
@@ -2428,10 +2567,13 @@ impl QueueHandler {
             // TODO: timeout (1s) => handle all in case something was missed
             select! {
                 events.control_irq => {
+                    diag::hit(Stat::ControlWake);
                     //trace!("- new control response");
                     self.control.handle_responses(&chan.data);
+                    diag::hit(Stat::ControlResponsesDone);
                     // We need this in case queue was full last time we got a control request
                     self.control.handle_requests(&mut self.pci_transport);
+                    diag::hit(Stat::ControlRequestsDone);
                 },
                 control_msg => {
                     //trace!("- new control request");
@@ -2445,8 +2587,7 @@ impl QueueHandler {
                     self.cursor.handle_requests(&mut self.pci_transport);
                 },
                 cursor_msg => {
-                    //trace!("- new cursor request");
-                    self.cursor.handle_responses(&chan.data);
+                    self.cursor.handle_requests(&mut self.pci_transport);
                 },
                 events.config_irq => {
                     // TODO
@@ -2462,6 +2603,7 @@ impl QueueHandler {
             };
 
             chan.data.handle_fence_submissions();
+            crate::guest_backing::reap_exited_backings();
 
             //trace!("- waiting for next message");
         }

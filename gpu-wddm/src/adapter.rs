@@ -501,6 +501,12 @@ impl DxgkInterface {
     }
 
     pub fn notify_interrupt_synchronized(&self, interrupt: Interrupt) -> Result<bool, NtStatus> {
+        use crate::bringup::runtime::{self as diag, Stat};
+        let completion = match interrupt {
+            Interrupt::DmaCompleted(engine, fence) => Some((engine.node_ordinal(), fence)),
+            _ => None,
+        };
+        if completion.is_some() { diag::hit(Stat::NotifyEnter); }
         //trace!("{}: ", function!());
 
         struct NotifyContext<'a> {
@@ -617,7 +623,12 @@ impl DxgkInterface {
             interface: self,
             interrupt,
         };
-        self.synchronize_execution(synchronize_routine, &mut context as *mut _ as _, 0)
+        let result = self.synchronize_execution(synchronize_routine, &mut context as *mut _ as _, 0);
+        if let Some((node, fence)) = completion {
+            diag::hit(Stat::NotifyReturn);
+            if matches!(result, Ok(true)) { diag::fence(2, node, fence); }
+        }
+        result
     }
 
     pub fn device_allocation_from_handle(&self, handle: D3DKMT_HANDLE) -> Option<Arc<DeviceSpecificAllocation>> {
@@ -2465,17 +2476,73 @@ impl Adapter {
             },
             ALLOCATE_3D_TAG => {
                 let alloc_3d = unsafe { &alloc_priv._3d };
+                let alloc_size = alloc_3d.size;
+                let alloc_target = alloc_3d.target;
+                let alloc_format = alloc_3d.format;
+                let alloc_bind = alloc_3d.bind;
 
-                let resource_id = chan.resource_create_3d(alloc_3d)?;
+                let resource_id = match chan.resource_create_3d(alloc_3d) {
+                    Ok(id) => {
+                        use core::sync::atomic::AtomicU32;
+                        static OK_3D: AtomicU32 = AtomicU32::new(0);
+                        crate::bringup::count("Alloc3dOkCount", &OK_3D);
+                        crate::bringup::record("Alloc3dLastResourceId", id.get());
+                        crate::bringup::record("Alloc3dLastBind", alloc_bind);
+                        error!(
+                            "{}: ALLOCATE_3D resource_create_3d ok id={} size={} target={} format={} bind=0x{:08x}",
+                            function!(), id, alloc_size, alloc_target, alloc_format, alloc_bind
+                        );
+                        id
+                    }
+                    Err(status) => {
+                        crate::bringup::record("Alloc3dResourceFail", status.0.to_u32());
+                        error!(
+                            "{}: ALLOCATE_3D resource_create_3d failed status={:?} size={} target={} format={} bind=0x{:08x}",
+                            function!(), status, alloc_size, alloc_target, alloc_format, alloc_bind
+                        );
+                        return Err(status);
+                    }
+                };
 
-                let allocation = Arc::try_new(Allocation::new(resource_id, submit_3d, *alloc_3d)?)?;
+                let allocation_value = match Allocation::new(resource_id, submit_3d, *alloc_3d) {
+                    Ok(value) => value,
+                    Err(status) => {
+                        crate::bringup::record("Alloc3dNewFail", status.0.to_u32());
+                        error!(
+                            "{}: ALLOCATE_3D Allocation::new failed id={} status={:?}",
+                            function!(), resource_id, status
+                        );
+                        return Err(status);
+                    }
+                };
+                let allocation = match Arc::try_new(allocation_value) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        crate::bringup::record("Alloc3dArcFail", STATUS::NO_MEMORY.to_u32());
+                        error!(
+                            "{}: ALLOCATE_3D Arc::try_new failed id={} status=NO_MEMORY",
+                            function!(), resource_id
+                        );
+                        return Err(NtStatus(STATUS::NO_MEMORY));
+                    }
+                };
 
                 debug!("allocated 3d: {:?}", allocation);
                 alloc_info.EvictionSegmentSet = 1;
                 alloc_info.PreferredSegment.set_SegmentId0(MemorySegment::Aperture3D as _);
                 alloc_info.PreferredSegment.set_Direction0(false);         // Allocate from start
-                alloc_info.FlagsWddm2_mut().set_CpuVisible(true);
-                //alloc_info.FlagsWddm2_mut().set_AccessedPhysically(true);
+                // Shadow/staging standard allocations carry MAP_COHERENT and
+                // must be CPU lockable. CreateStandardAllocation rejects them
+                // after successful creation if CpuVisible is clear. Segment
+                // CpuVisible describes a CPU aperture address; it generally
+                // has no meaning for an aperture segment's system-memory pages.
+                // The non-coherent shared primary uses SectionBackedPrimary.
+                let cpu_visible = crate::virgl::VirglFlags::from_bits_truncate(alloc_3d.flags)
+                    .contains(crate::virgl::VirglFlags::MAP_COHERENT);
+                alloc_info.FlagsWddm2_mut().set_CpuVisible(cpu_visible);
+                alloc_info.FlagsWddm2_mut().set_AccessedPhysically(true);
+                crate::bringup::record("Alloc3dLastCpuVisible", cpu_visible as u32);
+                crate::bringup::record("Alloc3dLastVirglFlags", alloc_3d.flags);
                 *alloc_info.SupportedReadSegmentSet_mut() = MemorySegment::Aperture3D.mask();
                 alloc_info.SupportedWriteSegmentSet = MemorySegment::Aperture3D.mask();
                 alloc_info.Size = alloc_3d.size;
@@ -2488,21 +2555,17 @@ impl Adapter {
             },
         }?;
 
-        /*
-        if create_allocation.Flags.Resource() {
-            create_allocation.hResource = TaggedExt::into_arc_handle(Resource::new(&allocation)?);
-        }
-        */
-
         let handle = TaggedExt::into_arc_handle(allocation);
         alloc_info.hAllocation = handle;
 
-        if alloc_priv.tag() == ALLOCATE_BLOB_TAG {
-            debug!("{}: blob handle: {:?}", function!(), handle);
-        }
-
+        // The resource wrapper is currently disabled; use the allocation handle
+        // as the opaque resource token so WDDM returns a non-zero hKMResource.
         if create_allocation.Flags.Resource() {
             create_allocation.hResource = handle;
+        }
+
+        if alloc_priv.tag() == ALLOCATE_BLOB_TAG {
+            debug!("{}: blob handle: {:?}", function!(), handle);
         }
 
         Ok(())
@@ -2548,9 +2611,14 @@ impl Adapter {
             );
         }
 
-        let _ = chan.resource_unref(id).inspect_err(|e|
-            { alloc.retain_guest_backing_on_unref_error(); error!("failed to unref resource {}: {:?}", id, e); }
-        );
+        let result = if let Some(backing) = alloc.guest_backing_owner() {
+            chan.resource_unref_backing(id, crate::queue::ResourceBacking::Guest(backing))
+        } else {
+            chan.resource_unref(id)
+        };
+        if let Err(e) = result {
+            error!("failed to unref resource {}: {:?}", id, e);
+        }
     }
 
     pub fn destroy_allocation(chan: &GpuChannel, alloc: Arc<Allocation>) {
