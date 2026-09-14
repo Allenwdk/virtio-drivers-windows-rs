@@ -1613,10 +1613,20 @@ impl Adapter {
 
             ESCAPE_RESOURCE_INFO_TAG => {
                 let res_info = check_buffer_size!(escape.pPrivateDriverData, escape.PrivateDriverDataSize, ResourceInfo)?;
-                let alloc = state.queue_handler.dxgk_interface().allocation_from_handle(res_info.handle).ok_or(STATUS::INVALID_HANDLE)?;
+                let handle = res_info.handle;
+                let Some(alloc) = state.queue_handler.dxgk_interface().allocation_from_handle(handle) else {
+                    crate::bringup::record("ResourceInfoInvalidHandle", handle);
+                    error!("{}: resource info invalid allocation handle 0x{:08x}", function!(), handle);
+                    return Err(NtStatus(STATUS::INVALID_HANDLE));
+                };
                 trace!("{}: res info for allocation {:?}", function!(), alloc);
 
-                let id = alloc.id().ok_or(STATUS::UNSUCCESSFUL)?.get();
+                let Some(id_nz) = alloc.id() else {
+                    crate::bringup::record("ResourceInfoMissingId", 1);
+                    error!("{}: resource info allocation has no resource id: {:?}", function!(), alloc);
+                    return Err(NtStatus(STATUS::UNSUCCESSFUL));
+                };
+                let id = id_nz.get();
                 let resource = alloc.resource().clone();
 
                 // TODO: virgl needs to query resources BEFORE context init
@@ -1625,7 +1635,24 @@ impl Adapter {
                     unsafe { res_info.info._3d.modifier == DRM_FORMAT_MOD_INVALID } &&
                     let Some(device) = <Device as TaggedExt>::from_arc_handle_clone(escape.hDevice)
                 {
-                    alloc.query_layout(device)?
+                    match alloc.query_layout(device) {
+                        Ok(layout) => layout,
+                        Err(status) => {
+                            crate::bringup::record("ResourceInfoLayoutFail", status.0.to_u32());
+                            error!("{}: resource info layout query failed id={} status={:?}; using linear fallback", function!(), id, status);
+                            let info = unsafe { &res_info.info._3d };
+                            Some(crate::virgl::VirglResourceLayout {
+                                modifier: 0,
+                                num_planes: 1,
+                                reserved: 0,
+                                planes: [crate::virgl::VirglResourceLayoutPlane {
+                                    offset: 0,
+                                    stride: info._3d.width.saturating_mul(4),
+                                    size: info._3d.width.saturating_mul(info._3d.height).saturating_mul(4),
+                                }; 4],
+                            })
+                        }
+                    }
                 } else {
                     None
                 }.unwrap_or(VirglResourceLayout {
@@ -2439,15 +2466,37 @@ impl Adapter {
                     return Err(NtStatus(STATUS::NOT_SUPPORTED));
                 }
 
-                let resource_id = chan.next_resource_id().ok_or(STATUS::NO_MEMORY)?;
-                let allocation = Arc::try_new(Allocation::new(resource_id, submit_3d, *alloc_blob)?)?;
+                // Optional extension: reference a blob already created on the
+                // ICD context. Never resolve a bare host blob_id globally.
+                let extra = size_of::<CreateAllocation>();
+                let source = if alloc_info.PrivateDriverDataSize as usize == extra + 12 {
+                    let bytes = alloc_info.pPrivateDriverData as *const u8;
+                    let tag = unsafe { (bytes.add(extra) as *const u64).read_unaligned() };
+                    if tag != 0x3145535545524242 { return Err(NtStatus(STATUS::INVALID_PARAMETER)); }
+                    unsafe { (bytes.add(extra + 8) as *const u32).read_unaligned() }
+                } else { 0 };
+                let allocation = if source != 0 {
+                    let existing = chan.dxgk_interface().allocation_from_handle(source).ok_or(STATUS::INVALID_HANDLE)?;
+                    match existing.resource() {
+                        VirtioResource::Blob { id, mem, flags, size, .. }
+                            if *id == alloc_blob.id && *mem == { alloc_blob.mem } && *flags == { alloc_blob.flags } && *size == alloc_blob.size => {},
+                        _ => return Err(NtStatus(STATUS::INVALID_PARAMETER)),
+                    }
+                    crate::bringup::record("ReuseBlobSource", source);
+                    existing
+                } else {
+                    let resource_id = chan.next_resource_id().ok_or(STATUS::NO_MEMORY)?;
+                    Arc::try_new(Allocation::new(resource_id, submit_3d, *alloc_blob)?)?
+                };
                 //debug!("{}: allocated blob: {:?}", function!(), allocation);
 
+                alloc_info.EvictionSegmentSet = 0; // Only aperture segments are valid eviction targets.
                 alloc_info.PreferredSegment.set_SegmentId0(MemorySegment::BlobHost3D as _);
                 alloc_info.PreferredSegment.set_Direction0(false); // Allocate from start
+                *alloc_info.Alignment_mut() = 0;
                 alloc_info.Size = alloc_blob.size;
                 alloc_info.FlagsWddm2_mut().set_CpuVisible(false);
-                alloc_info.FlagsWddm2_mut().set_AccessedPhysically(true);
+                alloc_info.FlagsWddm2_mut().set_AccessedPhysically(false);
                 *alloc_info.SupportedReadSegmentSet_mut() = MemorySegment::BlobHost3D.mask();
                 alloc_info.SupportedWriteSegmentSet = MemorySegment::BlobHost3D.mask();
 
@@ -2555,13 +2604,35 @@ impl Adapter {
             },
         }?;
 
+        // Separate resource-associated blobs from background ICD allocations.
+        if create_allocation.Flags.Resource() {
+            let prefix = if alloc_priv.tag() == ALLOCATE_BLOB_TAG { "BlobOut" } else { "ThreeDOut" };
+            let values = [
+                ("SizeLo", alloc_info.Size as u32),
+                ("SizeHi", (alloc_info.Size >> 32) as u32),
+                ("Alignment", *alloc_info.Alignment_mut()),
+                ("WriteSegments", alloc_info.SupportedWriteSegmentSet),
+                ("EvictionSegments", alloc_info.EvictionSegmentSet),
+                ("Priority", alloc_info.AllocationPriority),
+                ("Flags", unsafe { alloc_info.FlagsWddm2_mut().__bindgen_anon_1.Value }),
+                ("Preferred", unsafe { alloc_info.PreferredSegment.__bindgen_anon_1.Value }),
+            ];
+            for (suffix, value) in values {
+                crate::bringup::record(&alloc::format!("{}{}", prefix, suffix), value);
+            }
+        }
+
+        let resource = if create_allocation.Flags.Resource() {
+            Some(Resource::new(&allocation)?)
+        } else {
+            None
+        };
+
         let handle = TaggedExt::into_arc_handle(allocation);
         alloc_info.hAllocation = handle;
 
-        // The resource wrapper is currently disabled; use the allocation handle
-        // as the opaque resource token so WDDM returns a non-zero hKMResource.
-        if create_allocation.Flags.Resource() {
-            create_allocation.hResource = handle;
+        if let Some(resource) = resource {
+            create_allocation.hResource = TaggedExt::into_arc_handle(resource);
         }
 
         if alloc_priv.tag() == ALLOCATE_BLOB_TAG {
@@ -2643,7 +2714,6 @@ impl Adapter {
         let state = check_state!(self)?;
         let chan = &state.queue_handler.chan;
 
-        /*
         if destroy_allocation.Flags.DestroyResource() {
             if let Some(resource) = <Resource as TaggedExt>::from_arc_handle_owned(destroy_allocation.hResource) {
                 drop(resource);
@@ -2651,7 +2721,6 @@ impl Adapter {
                 error!("{}: invalid resource handle: {:?}", function!(), destroy_allocation.hResource);
             }
         }
-        */
 
         let allocations = slice_from_raw_parts(destroy_allocation.pAllocationList, destroy_allocation.NumAllocations as _);
 
@@ -2675,6 +2744,26 @@ impl Adapter {
 
         let state = check_state!(self)?;
         Ok(state.num_scanouts)
+    }
+
+    pub fn scanout_connected(&self, scanout: u32) -> Result<bool, NtStatus> {
+        let state = check_state!(self)?;
+        if scanout >= state.num_scanouts as u32 {
+            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        }
+
+        // num_scanouts is the device's output capacity, not the number of
+        // connected monitors. Query the host so disabled outputs do not become
+        // phantom desktops, and subsequent status queries can observe hotplug.
+        let displays = state.queue_handler.channel().get_display_info()?;
+        let mut connected_mask = 0u32;
+        for (index, display) in displays.iter().take(state.num_scanouts as usize).enumerate() {
+            if display.enabled != 0 {
+                connected_mask |= 1 << index;
+            }
+        }
+        crate::bringup::record("ConnectedScanoutMask", connected_mask);
+        Ok(displays[scanout as usize].enabled != 0)
     }
 
     pub fn query_child_relations(&self, child_relations: &mut [DXGK_CHILD_DESCRIPTOR]) {

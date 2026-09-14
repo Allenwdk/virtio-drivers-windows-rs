@@ -59,7 +59,7 @@ use crate::function;
 
 const VIRTIO_GPU_ALLOCATION_TAG: u64 = u64::from_ne_bytes(*b"VGPUALLO");
 const VIRTIO_GPU_DEVICE_SPECIFIC_ALLOCATION_TAG: u64 = u64::from_ne_bytes(*b"VGPUDEAL");
-//const VIRTIO_GPU_RESOURCE_TAG: u64 = u64::from_ne_bytes(*b"VGPURESO");
+const VIRTIO_GPU_RESOURCE_TAG: u64 = u64::from_ne_bytes(*b"VGPURESO");
 
 pub struct AllocationDesc {
     pub width: u32,
@@ -444,7 +444,7 @@ pub struct DeviceSpecificAllocation {
     //pub owned: Option<D3DKMT_HANDLE>,
     //pub alloc_kmt: D3DKMT_HANDLE,
     owned: Option<Arc<Allocation>>,
-    virgl: AtomicBool,
+    virgl: SpinMutex<bool>,
 }
 
 impl DeviceSpecificAllocation {
@@ -488,7 +488,7 @@ impl DeviceSpecificAllocation {
             } else {
                 None
             },
-            virgl: AtomicBool::new(shadow_virgl),
+            virgl: SpinMutex::new(shadow_virgl),
         })
     }
 
@@ -498,14 +498,18 @@ impl DeviceSpecificAllocation {
 
         if matches!(device.capset(), Some(CapsetId::Virgl) | Some(CapsetId::Virgl2)) {
             /* Already attached, nothing to do */
-        } else if self.virgl.swap(true, Ordering::SeqCst) {
-            /* Already attached, nothing to do */
         } else {
-            trace!("{}: attaching {} to shadow virgl context", function!(), alloc.id);
-            device.context_attach_virgl(alloc.id).inspect_err(|e| {
-                error!("{}: failed to attach to shadow virgl: {:?}", function!(), alloc);
-                error!("{}: device: {:?}", function!(), device);
-            })?;
+            let mut attached = self.virgl.lock();
+            if !*attached {
+                trace!("{}: attaching {} to shadow virgl context", function!(), alloc.id);
+                device.context_attach_virgl(alloc.id).inspect_err(|e| {
+                    error!("{}: failed to attach to shadow virgl: {:?}", function!(), alloc);
+                    error!("{}: device: {:?}", function!(), device);
+                })?;
+                // Publish attachment only after the host accepted it. Failed
+                // lazy context creation must remain retryable.
+                *attached = true;
+            }
         }
         Ok(())
     }
@@ -534,7 +538,7 @@ impl Drop for DeviceSpecificAllocation {
         };
 
         let context_id = device.context().and_then(|id| Some(id.get())).unwrap_or(0);
-        let has_virgl = self.virgl.load(Ordering::SeqCst);
+        let has_virgl = *self.virgl.get_mut();
 
         trace!("{}: detaching resource {} from context {} (shadow virgl: {})", function!(), alloc.id, context_id, has_virgl);
         match device.context_detach_resource(alloc.id, has_virgl) {
@@ -1180,7 +1184,6 @@ impl Drop for Allocation {
     }
 }
 
-/*
 #[repr(C)]
 #[derive(Tagged, Debug)]
 #[tagged(VIRTIO_GPU_RESOURCE_TAG)]
@@ -1220,4 +1223,4 @@ impl Resource {
 
         Ok(())
     }
-}*/
+}

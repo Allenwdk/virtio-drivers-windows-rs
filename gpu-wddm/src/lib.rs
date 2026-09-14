@@ -159,8 +159,11 @@ pub unsafe extern "C" fn driver_entry(
     registry_path: *mut UNICODE_STRING,
 ) -> NTSTATUS {
     bringup::record("DriverEntry", 1);
-    //logger::init(log::LevelFilter::Trace).unwrap();
-    logger::init(log::LevelFilter::Warn).unwrap();
+    logger::init(if cfg!(feature = "bringup-diagnostics") {
+        log::LevelFilter::Debug
+    } else {
+        log::LevelFilter::Warn
+    }).unwrap();
 
     warn!("starting VirtIO GPU {BUILD_VERSION} ({BUILD_DATE})");
 
@@ -430,11 +433,17 @@ unsafe extern "C" fn query_child_status(adapter: HANDLE, child_status: *mut DXGK
         Err(e) => return e.0.to_u32(),
     };
 
-    assert!(child_status.ChildUid < num_scanouts);
+    if child_status.ChildUid >= num_scanouts {
+        return STATUS::INVALID_PARAMETER.to_u32();
+    }
 
     match child_status.Type {
         DXGK_CHILD_STATUS_TYPE::StatusConnection => {
-            child_status.__bindgen_anon_1.HotPlug.Connected = gpu.queue_handler().is_some() as _;
+            let connected = match gpu.scanout_connected(child_status.ChildUid) {
+                Ok(connected) => connected,
+                Err(e) => return e.0.to_u32(),
+            };
+            child_status.__bindgen_anon_1.HotPlug.Connected = connected as _;
         },
         _ => {
             error!("{}: invalid child status query: {:?}", function!(), child_status.Type);
@@ -673,11 +682,27 @@ unsafe extern "C" fn create_allocation(adapter: HANDLE, create_allocation: *mut 
         bringup::record("CreateAllocLastFlagsResource", create_allocation.Flags.Resource() as u32);
     }
 
+    // Match the P1 transport request independently of background allocations.
+    let p1_request = if create_allocation.NumAllocations == 1 && !create_allocation.pAllocationInfo.is_null() {
+        let ai = unsafe { &*create_allocation.pAllocationInfo };
+        if ai.PrivateDriverDataSize as usize >= size_of::<uapi::CreateAllocation>() && !ai.pPrivateDriverData.is_null() {
+            let data = unsafe { &*(ai.pPrivateDriverData as *const uapi::CreateAllocation) };
+            unsafe { data.blob.tag == uapi::ALLOCATE_BLOB_TAG && data.blob.id == 7 && data.blob.size == 1114112 }
+        } else { false }
+    } else { false };
+    if p1_request {
+        bringup::record("P1TraceRevision", 912);
+        bringup::record("P1CreateEntered", 1);
+        bringup::record("P1CreateResourceFlag", create_allocation.Flags.Resource() as u32);
+        bringup::record("P1CreateReturned", 0);
+    }
+
     match gpu.allocate(create_allocation) {
         Ok(()) => {
             use core::sync::atomic::AtomicU32;
             static OK: AtomicU32 = AtomicU32::new(0);
             bringup::count("CreateAllocOkCount", &OK);
+            if p1_request { bringup::record("P1CreateReturned", 1); bringup::record("P1CreateStatus", 0); }
             let alloc_info = unsafe { &*create_allocation.pAllocationInfo };
             info!(
                 "{}: DxgkDdiCreateAllocation success num_allocations={} private_size={} allocation={:?}",
@@ -694,6 +719,7 @@ unsafe extern "C" fn create_allocation(adapter: HANDLE, create_allocation: *mut 
             static FAIL: AtomicU32 = AtomicU32::new(0);
             bringup::count("CreateAllocFailCount", &FAIL);
             bringup::record("CreateAllocLastFailStatus", status.0.to_u32());
+            if p1_request { bringup::record("P1CreateReturned", 1); bringup::record("P1CreateStatus", status.0.to_u32()); }
             error!(
                 "{}: DxgkDdiCreateAllocation failed num_allocations={} private_size={} status={:?}",
                 function!(),
@@ -790,6 +816,7 @@ unsafe extern "C" fn describe_allocation(adapter: HANDLE, describe_allocation: *
     trace!("{}", function!());
     let describe_allocation = check_arg!(mut describe_allocation);
     let alloc = check_handle_arc!(describe_allocation.hAllocation: Allocation);
+    if alloc.is_blob() && alloc.size() == 1114112 { bringup::record("P1DescribeEntered", 1); }
     match alloc.description() {
         Ok(desc) => {
             describe_allocation.Width = desc.width;

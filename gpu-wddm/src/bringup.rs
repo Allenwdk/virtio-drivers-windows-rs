@@ -51,7 +51,7 @@ pub mod runtime {
                 "RtControlWake", "RtControlResponsesDone", "RtControlRequestsDone",
                 "RtDmaCompleteEnter", "RtDmaCompleteReturn", "RtNotifyEnter", "RtNotifyReturn",
             ];
-            super::record("RuntimeDiagnosticsRevision", 61);
+            super::record("RuntimeDiagnosticsRevision", 938);
             for (name, counter) in NAMES.iter().zip(COUNTERS.iter()) {
                 super::record(name, counter.load(Ordering::Relaxed));
             }

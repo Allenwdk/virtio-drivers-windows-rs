@@ -79,6 +79,12 @@ impl Context3D {
     }
 }
 
+#[derive(Debug)]
+struct VirglBlitContext {
+    capset: CapsetId,
+    context: Option<Context3D>,
+}
+
 struct QueryBuffer {
     id: NonZero<u32>,
     buf: core::mem::ManuallyDrop<AlignedBox<[u8]>>,
@@ -137,7 +143,7 @@ pub struct Device {
     pub tag: u64,
     chan: GpuChannel,
     main_context: RwLock<Option<Context3D>>,
-    virgl_blit_context: RwLock<Option<Context3D>>,
+    virgl_blit_context: RwLock<Option<VirglBlitContext>>,
     query_buffer: SpinMutex<Option<QueryBuffer>>,
 }
 
@@ -206,7 +212,13 @@ impl Device {
                 CapsetId::Virgl
             };
 
-            self.virgl_blit_context.write().replace(Context3D::try_new(self.chan.clone(), capset_id, "venus-shadow-virgl-win32")?);
+            // DRM/Venus devices doing only blob rendering need no host GL
+            // context. Android EGL can exhaust its context pool even while
+            // the native DRM contexts still have capacity.
+            self.virgl_blit_context.write().replace(VirglBlitContext {
+                capset: capset_id,
+                context: None,
+            });
         }
 
         debug!("{}: debug name {}, main {:?}, blit {:?}", function!(), params.debug_name(), self.main_context, self.virgl_blit_context);
@@ -232,7 +244,7 @@ impl Device {
             Some((main_context.id, main_context.capset))
         } else {
             let virgl_blit_context = self.virgl_blit_context.read();
-            let Some(virgl_blit_context) = virgl_blit_context.deref() else {
+            let Some(virgl_blit_context) = virgl_blit_context.as_ref().and_then(|blit| blit.context.as_ref()) else {
                 return None;
             };
 
@@ -240,10 +252,29 @@ impl Device {
         }
     }
 
+    // Call only from paths that already submit synchronous resource/context
+    // commands, never from the interrupt/DPC submission path. Keep lookup and
+    // teardown passive: they must not create a context as a side effect.
+    fn ensure_virgl_context(&self) -> Result<(NonZero<u32>, CapsetId), NtStatus> {
+        if let Some(context) = self.context_virgl() {
+            return Ok(context);
+        }
+
+        let mut blit = self.virgl_blit_context.write();
+        let blit = blit.as_mut().ok_or(STATUS::REINITIALIZATION_NEEDED)?;
+        if blit.context.is_none() {
+            let context = Context3D::try_new(self.chan.clone(), blit.capset, "venus-shadow-virgl-win32")?;
+            crate::bringup::record("VirglLazyContextId", context.id.get());
+            blit.context = Some(context);
+        }
+        let context = blit.context.as_ref().unwrap();
+        Ok((context.id, context.capset))
+    }
+
     fn context_internal(&self, shadow_virgl: bool) -> Option<(NonZero<u32>, CapsetId)> {
         if shadow_virgl {
             let virgl_blit_context = self.virgl_blit_context.read();
-            let Some(virgl_blit_context) = virgl_blit_context.deref() else {
+            let Some(virgl_blit_context) = virgl_blit_context.as_ref().and_then(|blit| blit.context.as_ref()) else {
                 return None;
             };
             Some((virgl_blit_context.id, virgl_blit_context.capset))
@@ -257,9 +288,9 @@ impl Device {
     }
 
     pub fn query_layout(self: Arc<Device>, alloc: &Arc<Allocation>) -> Result<VirglResourceLayout, NtStatus> {
-        let ctx_id = self.context_internal(true).ok_or(STATUS::REINITIALIZATION_NEEDED)?.0;
         let device_specific = Allocation::attach_to_device(alloc.clone(), self.clone(), false)?;
         device_specific.ensure_virgl_attached()?;
+        let ctx_id = self.context_virgl().ok_or(STATUS::REINITIALIZATION_NEEDED)?.0;
 
         let target = alloc.id().unwrap();
 
@@ -378,17 +409,17 @@ impl Device {
         let dx = present.SrcRect.left - present.DstRect.left;
         let dy = present.SrcRect.top  - present.DstRect.top;
 
-        let Some((context_id, _)) = self.context_virgl() else {
-            warn!("{}: virtio context was not created yet: {:?}", function!(), self);
-            return Err(NtStatus(STATUS::REINITIALIZATION_NEEDED));
-        };
-
         src.ensure_virgl_attached().inspect_err(|e|
             error!("{}: failed to attach to virgl: {:?}", function!(), src_alloc)
         )?;
         dst.ensure_virgl_attached().inspect_err(|e|
             error!("{}: failed to attach to virgl: {:?}", function!(), dst_alloc)
         )?;
+
+        let Some((context_id, _)) = self.context_virgl() else {
+            warn!("{}: virtio context was not created yet: {:?}", function!(), self);
+            return Err(NtStatus(STATUS::REINITIALIZATION_NEEDED));
+        };
 
         if src_alloc.is_blob() {
             let needed = Command::virgl_set_type_dma_len();
@@ -671,7 +702,11 @@ impl Device {
                     },
                 };
 
-                let context = Some(self.context_internal(hdr.flags.contains(CommandFlag::SHADOW_VIRGL)).ok_or(STATUS::REINITIALIZATION_NEEDED)?.0);
+                let context = Some(if hdr.flags.contains(CommandFlag::SHADOW_VIRGL) {
+                    self.ensure_virgl_context()?.0
+                } else {
+                    self.context_internal(false).ok_or(STATUS::REINITIALIZATION_NEEDED)?.0
+                });
                 let ring = hdr.ring();
                 // TODO: if there is more than one item in the body, we probably want to actually set the ring
 
@@ -855,6 +890,9 @@ impl Device {
             //    warn!("{}: alloc: ({}, {:?}), dev: {:?}", function!(), alloc.id().unwrap(), alloc.resource(), self);
             //}
 
+            if alloc.is_blob() && alloc.size() == 1114112 {
+                crate::bringup::record("P1OpenEntered", 1);
+            }
             debug!("Opening allocation: {:?}", alloc);
             let device_specific = alloc.attach_to_device(self.clone(), false)?;
             alloc_info.hDeviceSpecificAllocation = TaggedExt::into_arc_handle(device_specific);
@@ -903,7 +941,8 @@ impl Device {
     }
 
     pub fn context_attach_virgl(&self, res_id: NonZero<u32>) -> Result<(), NtStatus> {
-        self.context_attach_resource_internal(res_id, true)
+        let context_id = self.ensure_virgl_context()?.0;
+        self.chan.context_attach_resource(context_id, res_id)
     }
 
     pub fn context_detach_resource(&self, res_id: NonZero<u32>, has_virgl: bool) -> Result<(), NtStatus> {
@@ -960,7 +999,7 @@ impl Drop for Device {
             );
         }
 
-        if let Some(blit) = self.virgl_blit_context.get_mut() {
+        if let Some(blit) = self.virgl_blit_context.get_mut().as_mut().and_then(|blit| blit.context.as_mut()) {
             debug!("Destroying context {:?}", blit);
 
             let _ = self.chan.context_destroy(blit.id).inspect_err(|e|

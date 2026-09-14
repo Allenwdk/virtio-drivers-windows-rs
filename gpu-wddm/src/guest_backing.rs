@@ -9,8 +9,8 @@ use wdk::wdm::*;
 use core::sync::atomic::AtomicU32;
 use crate::bringup;
 use alloc::vec::Vec;
-use core::mem::{ManuallyDrop, size_of};
-use virtio_drivers::device::gpu::commands::{MemEntry, ResourceCreateBlob};
+use core::mem::ManuallyDrop;
+use virtio_drivers::device::gpu::commands::MemEntry;
 #[path = "guest_backing_layout.rs"]
 mod layout;
 
@@ -137,14 +137,8 @@ impl GuestBacking {
 
     fn new_chunked(size: u64) -> Result<Self, NtStatus> {
         const CHUNK: usize = layout::CHUNK_SIZE;
-        // The control channel currently accepts one page of command bytes.
-        // Retain the old failure for larger fragmented allocations instead of
-        // advertising a partial backing or sending an oversized command.
-        let max_entries = (PAGE_SIZE as usize - size_of::<ResourceCreateBlob>()) / size_of::<MemEntry>();
-        if size / CHUNK as u64 > max_entries as u64 {
-            bringup::record("GuestBackingChunkTooLarge", size as u32);
-            return Err(NtStatus(STATUS::NO_MEMORY));
-        }
+        // RESOURCE_CREATE_BLOB uses owned DMA storage for multi-page lists,
+        // so large BOs need not fit all 64 KiB segments into one command page.
         let mdl = unsafe { MmAllocatePagesForMdlEx(
             LARGE_INTEGER { QuadPart: 0 }, LARGE_INTEGER { QuadPart: 0xFFFFFFFFFF },
             LARGE_INTEGER { QuadPart: CHUNK as i64 }, size as _,

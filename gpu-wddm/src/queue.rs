@@ -399,7 +399,7 @@ impl<const MAX_INLINE: usize> MaybeInlineBuffer<MAX_INLINE> {
     }
 
     fn try_from_hdr_with_body<T: IntoBytes + KnownLayout + Immutable>(hdr: T, body: &[u8]) -> Result<Self, NtStatus> {
-        let size = size_of::<T>() + body.len();
+        let size = size_of::<T>().checked_add(body.len()).ok_or(STATUS::INVALID_PARAMETER)?;
 
         Ok(if size <= MAX_INLINE {
             MaybeInlineBuffer::Inline {
@@ -421,8 +421,18 @@ impl<const MAX_INLINE: usize> MaybeInlineBuffer<MAX_INLINE> {
                 data: v.into_boxed_slice(),
             }
         } else {
-            error!("cannot handle multi-page boxes yet: size {} is too big)", size);
-            return Err(NtStatus(STATUS::NO_MEMORY));
+            // Fragmented blob backings can have more than one page of memory
+            // entries. Use the same owned, physically contiguous DMA storage
+            // as submit_command_sync, including its lifetime after timeout.
+            let mut input = MaybeInlineBuffer::OwnedDma {
+                allocation: Arc::try_new(Dma::<DxgkInterface>::new(
+                    size.div_ceil(PAGE_SIZE), BufferDirection::DriverToDevice, false,
+                )?)?,
+                len: size,
+            };
+            hdr.write_to_prefix(input.as_mut())?;
+            input.as_mut()[size_of::<T>()..].copy_from_slice(body);
+            input
         })
     }
 
@@ -2038,6 +2048,10 @@ impl GpuChannel {
         };
 
         let input = MaybeInlineBuffer::try_from_hdr_with_body(cmd, entries.as_bytes())?;
+        if input.as_ref().len() > PAGE_SIZE {
+            crate::bringup::record("BlobCreateLargeInputBytes", input.as_ref().len() as u32);
+            crate::bringup::record("BlobCreateLargeEntries", entries.len() as u32);
+        }
         let output = MaybeInlineBuffer::try_new_zeroed::<commands::CtrlHeader>()?;
         let response = self.control.request_blocking_buf(input, output, DEFAULT_BLOCKING_TIMEOUT)?;
         let resp = commands::CtrlHeader::read_from_prefix(response.as_ref()).unwrap().0;
