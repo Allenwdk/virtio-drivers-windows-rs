@@ -814,6 +814,7 @@ unsafe extern "C" fn close_allocation(device: HANDLE, close_allocation: *const D
 
 unsafe extern "C" fn describe_allocation(adapter: HANDLE, describe_allocation: *mut DXGKARG_DESCRIBEALLOCATION) -> NTSTATUS {
     trace!("{}", function!());
+    let gpu = check_handle!(adapter: Adapter);
     let describe_allocation = check_arg!(mut describe_allocation);
     let alloc = check_handle_arc!(describe_allocation.hAllocation: Allocation);
     if alloc.is_blob() && alloc.size() == 1114112 { bringup::record("P1DescribeEntered", 1); }
@@ -823,7 +824,15 @@ unsafe extern "C" fn describe_allocation(adapter: HANDLE, describe_allocation: *
             describe_allocation.Height = desc.height;
             describe_allocation.Format = desc.format;
             describe_allocation.MultisampleMethod = D3DDDI_MULTISAMPLINGMETHOD { NumSamples: 1, NumQualityLevels: 1 };
-            describe_allocation.RefreshRate = D3DDDI_RATIONAL { Numerator: 148500000, Denominator: 2475000 };
+            let mut rate = alloc.primary_refresh_rate();
+            if rate.Numerator == 0 || rate.Denominator == 0 {
+                // Unspecified UMD rates use the source mode; dxgkrnl rejects 0/0 here.
+                rate = match gpu.refresh_rate_for_source(alloc.primary_source()) {
+                    Ok(hz) => D3DDDI_RATIONAL { Numerator: hz, Denominator: 1 },
+                    Err(e) => return e.0.to_u32(),
+                };
+            }
+            describe_allocation.RefreshRate = rate;
             describe_allocation.PrivateDriverFormatAttribute = 0;
             STATUS::SUCCESS
         }
@@ -856,18 +865,20 @@ unsafe extern "C" fn get_standard_allocation_driver_data(adapter: HANDLE, standa
     if standard_allocation.pResourcePrivateDriverData.is_null() ||
        standard_allocation.pAllocationPrivateDriverData.is_null() ||
        (standard_allocation.ResourcePrivateDriverDataSize as usize) < size_of::<CreateResource>() ||
-       (standard_allocation.AllocationPrivateDriverDataSize as usize) < size_of::<CreateAllocation>()
+       (standard_allocation.AllocationPrivateDriverDataSize as usize) < size_of::<allocation::StandardAllocationData>()
     {
         standard_allocation.pResourcePrivateDriverData = null_mut();
         standard_allocation.pAllocationPrivateDriverData = null_mut();
         standard_allocation.ResourcePrivateDriverDataSize = size_of::<CreateResource>() as _;
-        standard_allocation.AllocationPrivateDriverDataSize = size_of::<CreateAllocation>() as _;
+        standard_allocation.AllocationPrivateDriverDataSize = size_of::<allocation::StandardAllocationData>() as _;
         return STATUS::SUCCESS.to_u32();
     }
 
+    let mut refresh_rate = D3DDDI_RATIONAL { Numerator: 0, Denominator: 0 };
     let (width, height, size, format, flags) = match standard_allocation.StandardAllocationType {
         D3DKMDT_STANDARDALLOCATION_TYPE::D3DKMDT_STANDARDALLOCATION_SHAREDPRIMARYSURFACE => {
             let surface_data = unsafe { &*standard_allocation.__bindgen_anon_1.pCreateSharedPrimarySurfaceData };
+            refresh_rate = surface_data.RefreshRate;
             trace!("{}: {:?}", function!(), surface_data);
 
             let w = surface_data.Width;
@@ -918,7 +929,10 @@ unsafe extern "C" fn get_standard_allocation_driver_data(adapter: HANDLE, standa
     let resource_priv = unsafe { transmute::<_, &mut CreateResource>(standard_allocation.pResourcePrivateDriverData) };
     *resource_priv = CreateResource { tag: uapi::CREATE_RESOURCE_TAG, cmd: [] };
 
-    let alloc_priv = unsafe { transmute::<_, &mut CreateAllocation>(standard_allocation.pAllocationPrivateDriverData) };
+    let standard_data = unsafe { &mut *(standard_allocation.pAllocationPrivateDriverData as *mut allocation::StandardAllocationData) };
+    standard_data.tag = allocation::STANDARD_ALLOCATION_TAG;
+    standard_data.refresh_rate = refresh_rate;
+    let alloc_priv = &mut standard_data.allocation;
 
     let alloc_3d = unsafe { &mut alloc_priv._3d };
     *alloc_3d = Allocate3d {

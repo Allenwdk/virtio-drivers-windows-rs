@@ -67,6 +67,16 @@ pub struct AllocationDesc {
     pub format: D3DDDIFORMAT,
 }
 
+// KMD-generated standard allocations carry metadata after the unchanged UMD ABI prefix.
+#[repr(C)]
+pub struct StandardAllocationData {
+    pub allocation: crate::uapi::CreateAllocation,
+    pub tag: u64,
+    pub refresh_rate: wdk::dxgkrnl::D3DDDI_RATIONAL,
+}
+
+pub const STANDARD_ALLOCATION_TAG: u64 = u64::from_le_bytes(*b"VGPURATE");
+
 /*
 trait AtomicRW: Clone + Default {
     type Item;
@@ -572,6 +582,8 @@ const ALLOCATION_FLAG_MAPPED:  u32 = 1u32 << 1;
 #[tagged(VIRTIO_GPU_ALLOCATION_TAG)]
 pub struct Allocation {
     pub tag: u64,
+    primary_refresh_rate: AtomicU64,
+    primary_source: AtomicU32,
     id: NonZero<u32>,
     //create_fence: Pin<Arc<KeEvent>>,
     flags: AtomicU32,
@@ -612,6 +624,8 @@ impl Allocation {
 
         Ok(Self {
             tag: VIRTIO_GPU_ALLOCATION_TAG,
+            primary_refresh_rate: AtomicU64::new(0),
+            primary_source: AtomicU32::new(0),
             id,
             //fence,
             flags: AtomicU32::new(flags),
@@ -628,6 +642,29 @@ impl Allocation {
 
     pub fn guest_backing(&self) -> Option<&crate::guest_backing::GuestBacking> {
         self.guest_backing.as_deref()
+    }
+
+    pub fn set_primary_refresh_rate(&self, rate: wdk::dxgkrnl::D3DDDI_RATIONAL) {
+        self.primary_refresh_rate.store(
+            ((rate.Numerator as u64) << 32) | rate.Denominator as u64,
+            Ordering::Release,
+        );
+    }
+
+    pub fn primary_refresh_rate(&self) -> wdk::dxgkrnl::D3DDDI_RATIONAL {
+        let rate = self.primary_refresh_rate.load(Ordering::Acquire);
+        wdk::dxgkrnl::D3DDDI_RATIONAL {
+            Numerator: (rate >> 32) as u32,
+            Denominator: rate as u32,
+        }
+    }
+
+    pub fn set_primary_source(&self, source: u32) {
+        self.primary_source.store(source, Ordering::Release);
+    }
+
+    pub fn primary_source(&self) -> u32 {
+        self.primary_source.load(Ordering::Acquire)
     }
 
     pub fn guest_backing_owner(&self) -> Option<Arc<crate::guest_backing::GuestBacking>> {

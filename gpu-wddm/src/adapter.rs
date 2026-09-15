@@ -1253,6 +1253,7 @@ impl Adapter {
         let mut flipq = [const { None }; 16];
         let addrs = [const { AtomicU64::new(0) }; 16];
         let vsync_enabled = AtomicBool::new(false);
+        let mut refresh_rates = [0u32; 16];
         //let addrs = [const { (AtomicU64::new(0), AtomicPtr::new(null_mut())) }; 16];
 
         for scanout in 0..(num_scanouts as usize) {
@@ -1260,6 +1261,7 @@ impl Adapter {
             let _ = map_virtio_error!(edid.preferred_resolution())?;
 
             let info = VidPnOutput::new(display_modes[scanout], edid);
+            refresh_rates[scanout] = info.modes[0].refresh_rate;
 
             debug!("scanout {}: {:?}", scanout, info);
             for (i, mode) in info.modes.iter().enumerate() {
@@ -1291,6 +1293,9 @@ impl Adapter {
         if true {
 
         let flip_timer = FlipTimer::try_new(FlipTimerContext {
+            timer_rate: refresh_rates.iter().copied().max().unwrap_or(60).max(1) as u8,
+            refresh_rates,
+            refresh_phases: [const { AtomicU64::new(0) }; 16],
             rects,
             addrs,
             flipq,
@@ -2451,6 +2456,21 @@ impl Adapter {
 
         let alloc_priv = check_buffer_size!(alloc_info.pPrivateDriverData, alloc_info.PrivateDriverDataSize, CreateAllocation)?;
 
+        let primary_metadata = if alloc_info.PrivateDriverDataSize as usize == size_of::<CreateAllocation>() + 32 {
+            let bytes = alloc_info.pPrivateDriverData as *const u8;
+            let extra = size_of::<CreateAllocation>();
+            let reuse_tag = unsafe { (bytes.add(extra) as *const u64).read_unaligned() };
+            let tag = unsafe { (bytes.add(extra + 12) as *const u64).read_unaligned() };
+            if reuse_tag != 0x3145535545524242 || tag != 0x315952414d495250 {
+                return Err(NtStatus(STATUS::INVALID_PARAMETER));
+            }
+            let numerator = unsafe { (bytes.add(extra + 20) as *const u32).read_unaligned() };
+            let denominator = unsafe { (bytes.add(extra + 24) as *const u32).read_unaligned() };
+            let source = unsafe { (bytes.add(extra + 28) as *const u32).read_unaligned() };
+            if source >= 16 { return Err(NtStatus(STATUS::INVALID_PARAMETER)); }
+            Some((D3DDDI_RATIONAL { Numerator: numerator, Denominator: denominator }, source))
+        } else { None };
+
         let allocation = match alloc_priv.tag() {
             ALLOCATE_BLOB_TAG => {
                 let alloc_blob = unsafe { &alloc_priv.blob };
@@ -2469,7 +2489,7 @@ impl Adapter {
                 // Optional extension: reference a blob already created on the
                 // ICD context. Never resolve a bare host blob_id globally.
                 let extra = size_of::<CreateAllocation>();
-                let source = if alloc_info.PrivateDriverDataSize as usize == extra + 12 {
+                let source = if alloc_info.PrivateDriverDataSize as usize == extra + 12 || primary_metadata.is_some() {
                     let bytes = alloc_info.pPrivateDriverData as *const u8;
                     let tag = unsafe { (bytes.add(extra) as *const u64).read_unaligned() };
                     if tag != 0x3145535545524242 { return Err(NtStatus(STATUS::INVALID_PARAMETER)); }
@@ -2603,6 +2623,21 @@ impl Adapter {
                 Err(NtStatus(STATUS::INVALID_PARAMETER))
             },
         }?;
+
+        if alloc_priv.tag() == ALLOCATE_3D_TAG
+            && alloc_info.PrivateDriverDataSize as usize == size_of::<crate::allocation::StandardAllocationData>()
+        {
+            let data = unsafe { &*(alloc_info.pPrivateDriverData as *const crate::allocation::StandardAllocationData) };
+            if data.tag != crate::allocation::STANDARD_ALLOCATION_TAG {
+                return Err(NtStatus(STATUS::INVALID_PARAMETER));
+            }
+            allocation.set_primary_refresh_rate(data.refresh_rate);
+        }
+
+        if let Some((rate, source)) = primary_metadata {
+            allocation.set_primary_refresh_rate(rate);
+            allocation.set_primary_source(source);
+        }
 
         // Separate resource-associated blobs from background ICD allocations.
         if create_allocation.Flags.Resource() {
@@ -2916,6 +2951,15 @@ impl Adapter {
         }
 
         Ok(targets)
+    }
+
+    pub fn refresh_rate_for_source(&self, source: u32) -> Result<u32, NtStatus> {
+        let state = check_state!(self)?;
+        let target = self.targets_for_source(source).ok()
+            .and_then(|targets| targets.first().copied()).unwrap_or(source);
+        let output = state.outputs.get(target as usize).and_then(Option::as_ref)
+            .ok_or(NtStatus(STATUS::GRAPHICS_INVALID_VIDEO_PRESENT_SOURCE))?;
+        Ok(output.modes[output.current_mode.unwrap_or(0)].refresh_rate)
     }
 
     pub fn move_cursor(&self, set_pointer_position: &DXGKARG_SETPOINTERPOSITION) -> Result<(), NtStatus> {

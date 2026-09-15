@@ -154,6 +154,22 @@ impl Edid {
         Ok((dtd.h_active, dtd.v_active))
     }
 
+    /// Nominal frame rate of the first progressive detailed timing.
+    /// EDID pixel clocks have 10 kHz precision, so round to the nearest Hz.
+    pub fn preferred_refresh_rate(&self) -> Option<u32> {
+        let dtd = self.first_detailed_timing()?;
+        let bytes = &self.data[DTD1_OFFSET..][..DTD_LEN];
+        let clock = u16::from_le_bytes([bytes[0], bytes[1]]) as u64 * 10_000;
+        if clock == 0 || bytes[17] & 0x80 != 0 {
+            return None;
+        }
+        let h_blank = bytes[3] as u32 | ((bytes[4] as u32 & 0x0f) << 8);
+        let v_blank = bytes[6] as u32 | ((bytes[7] as u32 & 0x0f) << 8);
+        let pixels = (dtd.h_active + h_blank) as u64 * (dtd.v_active + v_blank) as u64;
+        let hz = ((clock + pixels / 2) / pixels) as u32;
+        (hz != 0).then_some(hz)
+    }
+
     /// Get the list of supported resolutions from EDID standard timings.
     ///
     /// Returns up to 8 (width, height) pairs sorted by total pixel count
@@ -174,6 +190,30 @@ impl Edid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferred_refresh_tracks_pixel_clock_and_blanking() {
+        for hz in [60u32, 90, 120, 144, 240] {
+            let mut data = qemu_edid();
+            let clock = (2200 * 1125 * hz / 10_000) as u16;
+            let dtd = &mut data[DTD1_OFFSET..][..DTD_LEN];
+            dtd[..2].copy_from_slice(&clock.to_le_bytes());
+            dtd[2..8].copy_from_slice(&[0x80, 0x18, 0x71, 0x38, 0x2d, 0x40]);
+            dtd[17] = 0;
+            assert_eq!(make_edid(data, 128).preferred_refresh_rate(), Some(hz));
+        }
+    }
+
+    #[test]
+    fn preferred_refresh_rejects_missing_clock_and_interlace() {
+        let mut data = qemu_edid();
+        assert_eq!(make_edid(data, 127).preferred_refresh_rate(), None);
+        data[DTD1_OFFSET + 17] |= 0x80;
+        assert_eq!(make_edid(data, 128).preferred_refresh_rate(), None);
+        data[DTD1_OFFSET + 17] &= !0x80;
+        data[DTD1_OFFSET..DTD1_OFFSET + 2].fill(0);
+        assert_eq!(make_edid(data, 128).preferred_refresh_rate(), None);
+    }
 
     /// Real EDID captured from QEMU virtio-GPU with `-device virtio-gpu,xres=1920,yres=1080`.
     /// QEMU generates this EDID dynamically. The base block (bytes 0-127) contains:

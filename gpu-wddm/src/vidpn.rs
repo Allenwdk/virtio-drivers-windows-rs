@@ -956,14 +956,11 @@ pub fn check_vidpn_source_mode(source_mode: &D3DKMDT_VIDPN_SOURCE_MODE) -> Resul
     Ok(())
 }
 
-pub const REFRESH_RATE_60HZ: (u32, u32) = (148500000, 2475000);
-
 #[derive(Debug, Clone, Copy)]
 pub struct MonitorMode {
     pub width: u32,
     pub height: u32,
-    // TODO
-    //pub refresh_rate: (u32, u32), /* (numerator, denomenator) */
+    pub refresh_rate: u32,
 }
 
 impl MonitorMode {
@@ -972,15 +969,9 @@ impl MonitorMode {
         info.TotalSize.cx = self.width;
         info.TotalSize.cy = self.height;
         info.ActiveSize = info.TotalSize;
-        if true {
-            info.VSyncFreq = (148500000, 2475000).into();
-            info.HSyncFreq = (67500, 1).into();
-            info.PixelRate = 148500000;
-        } else {
-            info.VSyncFreq = (!1, !1).into();
-            info.HSyncFreq = (!1, !1).into();
-            info.PixelRate = !1;
-        }
+        info.VSyncFreq = (self.refresh_rate, 1).into();
+        info.HSyncFreq = (self.height * self.refresh_rate, 1).into();
+        info.PixelRate = self.width as u64 * self.height as u64 * self.refresh_rate as u64;
         info.__bindgen_anon_1.ScanLineOrdering = D3DDDI_VIDEO_SIGNAL_SCANLINE_ORDERING::D3DDDI_VSSLO_PROGRESSIVE;
     }
 
@@ -996,6 +987,9 @@ impl MonitorMode {
 }
 
 pub struct FlipTimerContext {
+    pub refresh_rates: [u32; 16],
+    pub refresh_phases: [AtomicU64; 16],
+    pub timer_rate: u8,
     pub rects: [commands::Rect; 16],
     pub addrs: [AtomicU64; 16],
     //pub addrs: [(AtomicU64, AtomicPtr<Allocation>); 16],
@@ -1015,6 +1009,17 @@ impl FlipTimerContext {
             let Some(q) = q else {
                 continue;
             };
+
+            // A shared timer ticks at the fastest output rate. Slower outputs
+            // retain their own average cadence instead of receiving extra VSyncs.
+            let phase = self.refresh_phases[i].load(Ordering::Relaxed)
+                + self.refresh_rates[i] as u64;
+            let due = phase >= self.timer_rate as u64;
+            self.refresh_phases[i].store(
+                if due { phase - self.timer_rate as u64 } else { phase },
+                Ordering::Relaxed,
+            );
+            if !due { continue; }
 
             let Some((weak, addr)) = q.pop() else {
                 let addr = self.addrs[i].load(Ordering::Acquire);
@@ -1149,7 +1154,7 @@ impl FlipTimer {
     }
 
     pub fn start(&self) -> Result<(), NtStatus> {
-        Ok(self.timer.start_periodic(NtTime::fps(60))?)
+        Ok(self.timer.start_periodic(NtTime::fps(self.inner.timer_rate))?)
     }
 
     pub fn stop(&self) -> Result<(), NtStatus> {
@@ -1427,14 +1432,17 @@ impl VidPnOutput {
             (info.rect.width, info.rect.height)
         };
 
-        let modes = [MonitorMode { width: preferred.0, height: preferred.1 }]
+        // The virtual scanout keeps the host cadence when scaling resolutions.
+        let refresh_rate = edid.preferred_refresh_rate()
+            .filter(|hz| (24..=240).contains(hz)).unwrap_or(60);
+        let modes = [MonitorMode { width: preferred.0, height: preferred.1, refresh_rate }]
             .into_iter()
             .chain(edid
                 .standard_timings()
                 .iter()
                 .filter_map(|resolution|
                     if *resolution != preferred {
-                        Some(MonitorMode { width: resolution.0, height: resolution.1 })
+                        Some(MonitorMode { width: resolution.0, height: resolution.1, refresh_rate })
                     } else {
                         None
                     }
