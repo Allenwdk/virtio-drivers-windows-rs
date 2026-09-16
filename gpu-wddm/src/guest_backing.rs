@@ -100,10 +100,17 @@ impl core::fmt::Debug for GuestBacking {
 impl GuestBacking {
     pub fn new(size: u64) -> Result<Self, NtStatus> {
         reap_exited_backings();
-        // A 64 KiB-aligned start works with 4/16/64 KiB host pages. The BO size
-        // is negotiated separately; callers must provide a matching multiple.
+        // A 64 KiB-aligned start works with 4/16/64 KiB host pages. Vulkan/DXVK
+        // commonly reports a 4 KiB-aligned allocation size, while the guest
+        // backing protocol needs 64 KiB segments. Keep the logical blob size
+        // unchanged in Allocation/RESOURCE_CREATE_BLOB and pad only this
+        // physical backing; the host consumes entries only for the requested
+        // range. Reject overflow before rounding.
         const ALIGN: u64 = 65536;
-        if size == 0 || size > u32::MAX as u64 - ALIGN || size & (ALIGN - 1) != 0 {
+        let Some(size) = size.checked_add(ALIGN - 1).map(|size| size & !(ALIGN - 1)) else {
+            return Err(NtStatus(STATUS::INVALID_PARAMETER));
+        };
+        if size == 0 || size > u32::MAX as u64 {
             return Err(NtStatus(STATUS::INVALID_PARAMETER));
         }
         let Some(raw) = NonNull::new(unsafe {
@@ -139,12 +146,24 @@ impl GuestBacking {
         const CHUNK: usize = layout::CHUNK_SIZE;
         // RESOURCE_CREATE_BLOB uses owned DMA storage for multi-page lists,
         // so large BOs need not fit all 64 KiB segments into one command page.
-        let mdl = unsafe { MmAllocatePagesForMdlEx(
+        // The first attempt must stay nonblocking because this function is also
+        // reachable from allocation callbacks that may be latency-sensitive.
+        // CreateAllocation runs at PASSIVE_LEVEL, though, so a transiently
+        // fragmented page allocator can be retried with reclaim enabled before
+        // reporting a false GPU out-of-memory error to the UMD.
+        const FLAGS: u32 = MM_ALLOCATE_REQUIRE_CONTIGUOUS_CHUNKS | MM_ALLOCATE_FULLY_REQUIRED;
+        let mut mdl = unsafe { MmAllocatePagesForMdlEx(
             LARGE_INTEGER { QuadPart: 0 }, LARGE_INTEGER { QuadPart: 0xFFFFFFFFFF },
             LARGE_INTEGER { QuadPart: CHUNK as i64 }, size as _,
-            MEMORY_CACHING_TYPE::MmCached,
-            MM_ALLOCATE_REQUIRE_CONTIGUOUS_CHUNKS | MM_ALLOCATE_FULLY_REQUIRED | MM_ALLOCATE_NO_WAIT,
+            MEMORY_CACHING_TYPE::MmCached, FLAGS | MM_ALLOCATE_NO_WAIT,
         ) };
+        if mdl.is_null() && unsafe { KeGetCurrentIrql() } as u32 <= PASSIVE_LEVEL {
+            mdl = unsafe { MmAllocatePagesForMdlEx(
+                LARGE_INTEGER { QuadPart: 0 }, LARGE_INTEGER { QuadPart: 0xFFFFFFFFFF },
+                LARGE_INTEGER { QuadPart: CHUNK as i64 }, size as _,
+                MEMORY_CACHING_TYPE::MmCached, FLAGS,
+            ) };
+        }
         if mdl.is_null() {
             bringup::count("GuestBackingChunkFailCount", &CHUNK_FAIL);
             record_alloc_failure(3, size);

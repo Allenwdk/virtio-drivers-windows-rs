@@ -409,6 +409,7 @@ pub struct BlobInfo {
     pub modifier: u64,
     pub strides: [u32; 4],
     pub offsets: [u32; 4],
+    pub dxgi_format: u32,
 }
 
 #[repr(C, packed)]
@@ -1035,7 +1036,9 @@ const _: () = assert!(core::mem::size_of::<Capset>() == 16);
 const _: () = assert!(core::mem::size_of::<ContextInit>() == 80);
 const _: () = assert!(core::mem::size_of::<ResourceInfo>() == 148);
 const _: () = assert!(core::mem::size_of::<ResourceBusy>() == 22);
-const _: () = assert!(core::mem::size_of::<BlobInfoSet>() == 72);
+const _: () = assert!(core::mem::size_of::<BlobInfo>() == 60);
+const _: () = assert!(core::mem::size_of::<AllocateBlobFull>() == 94);
+const _: () = assert!(core::mem::size_of::<BlobInfoSet>() == 76);
 const _: () = assert!(core::mem::size_of::<Escape>() == 148);
 const _: () = assert!(core::mem::size_of::<AllocateBlob>() == 32);
 const _: () = assert!(core::mem::size_of::<Allocate3d>() == 56);

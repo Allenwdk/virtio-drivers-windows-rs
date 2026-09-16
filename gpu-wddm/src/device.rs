@@ -449,7 +449,7 @@ impl Device {
             }
 
             let id = dst_alloc.id().unwrap();
-            if let VirtioResource::Blob { info, .. } = src_alloc.resource() && let Some(info) = *info.read() {
+            if let VirtioResource::Blob { info, .. } = dst_alloc.resource() && let Some(info) = *info.read() {
                 let cmd = Command::virgl_set_type(&self.chan, Some(context_id), id, &info, None, &mut dmabuf[dmabuf_offset..]);
                 dmabuf_offset += cmd.len();
                 dma_priv.commands.push(cmd);
