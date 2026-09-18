@@ -947,18 +947,21 @@ impl Engine {
     const GRAPHICS_ENGINE:    u32 = 0;
     const PHYS_OTHER_ENGINE:  u32 = 1;
     const COPY_ENGINE:        u32 = 2;
-    const OTHER_ENGINE_START: u32 = 3;
-    const OTHER_ENGINE_COUNT: u32 = 61;
-    const OTHER_ENGINE_END:   u32 = Engine::OTHER_ENGINE_START + Engine::OTHER_ENGINE_COUNT - 1;
-
-    pub const TOTAL_COUNT: u32 = Engine::OTHER_ENGINE_START + Engine::OTHER_ENGINE_COUNT;
+    /*
+     * This device has one render node, one physical-other node, and one
+     * paging/copy node. Do not advertise the spare node ordinals accepted by
+     * the old command decoder as GPU nodes: dxgkrnl uses this value to create
+     * the scheduler/statistics topology, and there is no corresponding
+     * hardware engine behind those ordinals.
+     */
+    pub const TOTAL_COUNT: u32 = 3;
+    pub const NODE_MASK: u64 = (1u64 << Self::TOTAL_COUNT) - 1;
 
     pub const fn try_from_node_ordinal(index: u32) -> Option<Self> {
         match index {
             Engine::GRAPHICS_ENGINE => Some(Engine::Graphics),
             Engine::COPY_ENGINE => Some(Engine::Copy),
             Engine::PHYS_OTHER_ENGINE => Some(Engine::PhysicalOther),
-            Engine::OTHER_ENGINE_START..=Engine::OTHER_ENGINE_END => Some(Engine::Other((index - Engine::OTHER_ENGINE_START) as _)),
             _ => None,
         }
     }
@@ -968,11 +971,7 @@ impl Engine {
             Engine::Graphics => Engine::GRAPHICS_ENGINE,
             Engine::Copy => Engine::COPY_ENGINE,
             Engine::PhysicalOther => Engine::PHYS_OTHER_ENGINE,
-            Engine::Other(i) => {
-                let i = *i as u32;
-                assert!(i < Engine::OTHER_ENGINE_COUNT);
-                Engine::OTHER_ENGINE_START + i
-            },
+            Engine::Other(_) => panic!(),
         }
     }
 
@@ -1469,10 +1468,10 @@ impl Adapter {
                 trace!("{}: {:?}: stride = {}", function!(), query_info.Type, segment_info.SegmentDescriptorStride);
 
                 if segment_info.pSegmentDescriptor.is_null() {
-                    segment_info.NbSegment = 3;
+                    segment_info.NbSegment = MemorySegment::COUNT;
                     segment_info.SegmentDescriptorStride = size_of::<DXGK_SEGMENTDESCRIPTOR4>() as _;
                 } else {
-                    assert!(segment_info.NbSegment == 3);
+                    assert!(segment_info.NbSegment == MemorySegment::COUNT);
                     assert!(size_of::<DXGK_SEGMENTDESCRIPTOR4>() <= segment_info.SegmentDescriptorStride as usize);
 
                     segment_info.PagingBufferPrivateDataSize = 8192;
@@ -2510,36 +2509,22 @@ impl Adapter {
                 };
                 //debug!("{}: allocated blob: {:?}", function!(), allocation);
 
-                alloc_info.EvictionSegmentSet = 0; // Only aperture segments are valid eviction targets.
-                alloc_info.PreferredSegment.set_SegmentId0(MemorySegment::BlobHost3D as _);
+                // BlobFlag::MAPPABLE describes the CPU mapping protocol, not
+                // the allocation's physical VidMm placement. BlobMap creates
+                // a temporary shmem mapping for a HOST3D blob; it does not
+                // turn the blob into a shmem-backed allocation. Keep the
+                // existing Host3D placement so DWM/WSI allocations do not
+                // enter the reserved BlobMappable segment.
+                let segment = MemorySegment::BlobHost3D;
+                alloc_info.EvictionSegmentSet = 0; // Blob segments are not eviction targets.
+                alloc_info.PreferredSegment.set_SegmentId0(segment as _);
                 alloc_info.PreferredSegment.set_Direction0(false); // Allocate from start
                 *alloc_info.Alignment_mut() = 0;
                 alloc_info.Size = alloc_blob.size;
                 alloc_info.FlagsWddm2_mut().set_CpuVisible(false);
                 alloc_info.FlagsWddm2_mut().set_AccessedPhysically(false);
-                *alloc_info.SupportedReadSegmentSet_mut() = MemorySegment::BlobHost3D.mask();
-                alloc_info.SupportedWriteSegmentSet = MemorySegment::BlobHost3D.mask();
-
-                /*
-                if { alloc_blob.flags }.contains(BlobFlag::MAPPABLE) {
-                    alloc_info.PreferredSegment.set_SegmentId0(SEGMENT_ID_BLOB_MAPPABLE);
-                    alloc_info.PreferredSegment.set_Direction0(false); // Allocate from start
-                    alloc_info.Flags_mut().set_CpuVisible(true);
-                    *alloc_info.SupportedReadSegmentSet_mut() = 1 << (SEGMENT_ID_BLOB_MAPPABLE - 1);
-                    alloc_info.SupportedWriteSegmentSet = 1 << (SEGMENT_ID_BLOB_MAPPABLE - 1);
-                    alloc_info.Size = alloc_blob.size;
-                } else {
-                    alloc_info.PreferredSegment.set_SegmentId0(SEGMENT_ID_BLOB_HOST3D);
-                    alloc_info.PreferredSegment.set_Direction0(false); // Allocate from start
-                    alloc_info.Size = alloc_blob.size;
-
-                    /* FIXME: these should not be required, but see above
-                     * in the query_info for DXGK_QUERYADAPTERINFOTYPE::DXGKQAITYPE_QUERYSEGMENT3 */
-                    alloc_info.Flags_mut().set_CpuVisible(false);
-                    *alloc_info.SupportedReadSegmentSet_mut() = 1 << (SEGMENT_ID_BLOB_HOST3D - 1);
-                    alloc_info.SupportedWriteSegmentSet = 1 << (SEGMENT_ID_BLOB_HOST3D - 1);
-                }
-                */
+                *alloc_info.SupportedReadSegmentSet_mut() = segment.mask();
+                alloc_info.SupportedWriteSegmentSet = segment.mask();
 
                 Ok(allocation)
             },

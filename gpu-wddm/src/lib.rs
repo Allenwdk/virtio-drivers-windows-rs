@@ -1807,7 +1807,7 @@ unsafe extern "C" fn query_dependent_engine_group(adapter: HANDLE, query: *mut D
 
     info!("{}: engine {:?} last completed: {}, last submitted: {}", function!(), engine, last_completed, last_submitted);
 
-    query.DependentNodeOrdinalMask = u64::MAX;
+    query.DependentNodeOrdinalMask = Engine::NODE_MASK;
 
     STATUS::SUCCESS.to_u32()
 }

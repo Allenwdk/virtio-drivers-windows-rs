@@ -62,12 +62,12 @@ pub enum MemorySegment {
 }
 
 impl MemorySegment {
-    pub const COUNT: u32 = 3;
-    pub const SEGMENTS: [MemorySegment; Self::COUNT as usize] = [
+    pub const SEGMENTS: [MemorySegment; 3] = [
         MemorySegment::Aperture3D,
         MemorySegment::BlobMappable,
         MemorySegment::BlobHost3D,
     ];
+    pub const COUNT: u32 = Self::SEGMENTS.len() as u32;
 
     #[inline]
     pub const fn mask(&self) -> u32 {
