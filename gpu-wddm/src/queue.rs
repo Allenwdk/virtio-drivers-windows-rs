@@ -2578,7 +2578,6 @@ impl QueueHandler {
         //};
 
         loop {
-            // TODO: timeout (1s) => handle all in case something was missed
             select! {
                 events.control_irq => {
                     diag::hit(Stat::ControlWake);
@@ -2610,6 +2609,17 @@ impl QueueHandler {
                 events.stop => {
                     info!("- stopping thread");
                     return;
+                };
+                timeout(NtTime::relative_ms(5)) => {
+                    // Poll fallback for lost device interrupts: Gunyah never
+                    // wakes a WFI vCPU for the INTx (win3d/docs/GPU间隔卡顿-20260918.md),
+                    // so during blob-allocation storms the irq events stay unset and
+                    // every blocking request (D3DKMTAllocate et al) freezes the desktop
+                    // ~1s until a timer wake. Draining the used rings here bounds that
+                    // at the poll period; empty rings are a cheap no-op.
+                    self.control.handle_responses(&chan.data);
+                    self.control.handle_requests(&mut self.pci_transport);
+                    self.cursor.handle_responses(&chan.data);
                 };
                 error(e) => {
                     error!("{}: error: {:?}", function!(), e);

@@ -541,6 +541,8 @@ macro_rules! select {
     (
         $($handle:expr => $block:expr),+ $(,)?
         ;
+        $(timeout($timeout_dur:expr) => $timeout_block:expr $(,)?
+        ;)?
         error($err:ident) => $err_block:expr $(,)?
     ) => {{
         use core::{
@@ -576,6 +578,14 @@ macro_rules! select {
         let mut handles: [PVOID; N_OBJECTS] = [ $($handle),+ ].map(|h| h.get() as PVOID);
         let mut blocks = pin!(([MaybeUninit::<KWAIT_BLOCK>::uninit(); N_OBJECTS], PhantomPinned));
 
+        // Optional bounded wait: Gunyah loses device interrupts for WFI vCPUs
+        // (win3d/docs/GPU间隔卡顿-20260918.md), so callers reacting to
+        // interrupt-driven events arm a timeout and poll on expiry instead of
+        // blocking forever on a wake that never arrives.
+        let mut timeout = NtTime::INFINITE;
+        let mut timeout_armed = false;
+        $( timeout = $timeout_dur; timeout_armed = true; )?
+
         assert_irql!(<= APC_LEVEL);
         let status = unsafe {
             KeWaitForMultipleObjects(
@@ -584,12 +594,14 @@ macro_rules! select {
                 KWAIT_REASON::Executive,
                 MODE::KernelMode.0 as _,
                 false as _,
-                NtTime::INFINITE.get(),
+                timeout.get(),
                 blocks.get_unchecked_mut().0.as_ptr() as *mut _
             )
         };
 
-        if status >= WAIT_OBJECT_0 && status < WAIT_OBJECT_N {
+        if status == STATUS::TIMEOUT.to_u32() && timeout_armed {
+            $( $timeout_block )?
+        } else if status >= WAIT_OBJECT_0 && status < WAIT_OBJECT_N {
             let index = (status - WAIT_OBJECT_0) as usize;
             select_if_chain!(index, 0, $($handle => $block),+)
         } else {
