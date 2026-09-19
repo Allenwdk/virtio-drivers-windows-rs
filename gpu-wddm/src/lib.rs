@@ -1381,6 +1381,10 @@ unsafe extern "C" fn create_context(device: HANDLE, create_context: *mut DXGKARG
             return e.to_u32();
         }
     } else {
+        /* Honor VirtualAddressing only for engines that already advertise
+         * GpuMmuSupported (Copy / Other). Graphics must stay a 1 MB physical
+         * DMA context: 979 honoured the flag for 3D as well and BSODed
+         * (gpu-stats-plan.md §11.5). */
         match engine {
             Engine::Graphics | Engine::PhysicalOther => {
                 create_context.hContext = TaggedExt::into_arc_handle(context);

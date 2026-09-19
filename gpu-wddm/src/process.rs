@@ -93,12 +93,25 @@ impl MemorySegment {
     }
 
     #[inline]
-    pub const fn size(&self, shmem_len: u64) -> u64 {
+    /// Built-in BlobHost3D size when the host does not advertise a budget
+    /// (crosvm without DROIDVM_VRAM_BUDGET). Historical value.
+    pub const HOST3D_DEFAULT: u64 = 16 * 1024 * 1024 * 1024;
+
+    /// `shmem_len` is the host-visible BAR; `host3d_budget` is the size dxgkrnl
+    /// sees for BlobHost3D, i.e. DXGI DedicatedVideoMemory and the VidMm commit
+    /// limit that makes over-budget CreateAllocation fail in the guest instead
+    /// of over-committing host memory.
+    pub const fn size(&self, shmem_len: u64, host3d_budget: u64) -> u64 {
+        let _ = shmem_len;
         match self {
             MemorySegment::ImplicitSystemMemory => unreachable!(),
             MemorySegment::Aperture3D   => 1024 * 1024 * 1024,
-            MemorySegment::BlobHost3D   => 16 * 1024 * 1024 * 1024,
-            MemorySegment::BlobMappable => shmem_len,
+            MemorySegment::BlobHost3D   => host3d_budget,
+            // Reserved: no allocation is ever placed here (BlobMap uses the KMD's
+            // own offset allocator on the BAR, not VidMm). Reporting the BAR size
+            // (4 GiB) made DXGI add it to DedicatedVideoMemory; keep the segment
+            // (segment ids are baked into PTEs and SEGMENTS indices) but tiny.
+            MemorySegment::BlobMappable => 1024 * 1024,
         }
     }
 
@@ -131,10 +144,10 @@ impl MemorySegment {
         flags
     }
 
-    pub fn fill_desc3(&self, shmem_start: u64, shmem_len: u64, desc: &mut DXGK_SEGMENTDESCRIPTOR3) {
+    pub fn fill_desc3(&self, shmem_start: u64, shmem_len: u64, host3d_budget: u64, desc: &mut DXGK_SEGMENTDESCRIPTOR3) {
         desc.BaseAddress.QuadPart = self.phys() as _;
-        desc.Size = self.size(shmem_len) as _;
-        desc.CommitLimit = self.size(shmem_len) as _;
+        desc.Size = self.size(shmem_len, host3d_budget) as _;
+        desc.CommitLimit = self.size(shmem_len, host3d_budget) as _;
         desc.Flags = self.flags();
 
         if matches!(self, MemorySegment::BlobMappable) {
@@ -142,10 +155,10 @@ impl MemorySegment {
         }
     }
 
-    pub fn fill_desc4(&self, shmem_start: u64, shmem_len: u64, desc: &mut DXGK_SEGMENTDESCRIPTOR4) {
+    pub fn fill_desc4(&self, shmem_start: u64, shmem_len: u64, host3d_budget: u64, desc: &mut DXGK_SEGMENTDESCRIPTOR4) {
         desc.BaseAddress.QuadPart = self.phys() as _;
-        desc.Size = self.size(shmem_len) as _;
-        desc.CommitLimit = self.size(shmem_len) as _;
+        desc.Size = self.size(shmem_len, host3d_budget) as _;
+        desc.CommitLimit = self.size(shmem_len, host3d_budget) as _;
         desc.Flags = self.flags();
 
         if matches!(self, MemorySegment::BlobMappable) {

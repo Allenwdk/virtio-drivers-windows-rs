@@ -449,6 +449,8 @@ bitflags! {
         const CONTEXT_INIT          = 1 << 4;
         /// DroidVM fixed boot-shared DRM pool descriptor at config offset 16.
         const DROIDVM_BOOT_POOL     = 1 << 7;
+        /// DroidVM host3d VRAM budget descriptor at config offset 48.
+        const DROIDVM_VRAM_BUDGET   = 1 << 8;
         const CREATE_GUEST_HANDLE   = 1 << 6;
 
         // device independent

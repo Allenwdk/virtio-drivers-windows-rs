@@ -371,6 +371,7 @@ const SUPPORTED_FEATURES: Features = Features::RING_EVENT_IDX
     .union(Features::RESOURCE_BLOB)
     .union(Features::CONTEXT_INIT)
     .union(Features::DROIDVM_BOOT_POOL)
+    .union(Features::DROIDVM_VRAM_BUDGET)
     .union(Features::CREATE_GUEST_HANDLE);
 
 //#[derive(Clone)]
@@ -980,6 +981,10 @@ impl Engine {
             Engine::Graphics => {
                 debug!("{}: {:?} -> DXGK_ENGINE_TYPE_3D", function!(), self);
                 metadata.EngineType = DXGK_ENGINE_TYPE::DXGK_ENGINE_TYPE_3D;
+                /* Do not set GpuMmuSupported here. 979 did; it is node-level
+                 * metadata, so DWM's physical 3D contexts were also treated as
+                 * GpuMmu and the guest BSODed on the first reboot. Copy already
+                 * advertises GpuMmu; keep 3D physical. */
             },
             Engine::Copy => {
                 debug!("{}: {:?} -> DXGK_ENGINE_TYPE_COPY", function!(), self);
@@ -1422,9 +1427,10 @@ impl Adapter {
                     };
 
                     let (shmem_start, shmem_len) = state.queue_handler.get_shmem_slice();
+                    let host3d_budget = state.queue_handler.host3d_budget();
 
                     for segment in MemorySegment::SEGMENTS {
-                        segment.fill_desc3(shmem_start, shmem_len, &mut descriptors[segment.index() as usize]);
+                        segment.fill_desc3(shmem_start, shmem_len, host3d_budget, &mut descriptors[segment.index() as usize]);
                     }
 
                     /*
@@ -1484,10 +1490,11 @@ impl Adapter {
                     //let desc_blob_host3d   = unsafe { &mut *(segment_info.pSegmentDescriptor.offset((segment_info.SegmentDescriptorStride * (SEGMENT_ID_BLOB_HOST3D as u64 - 1)) as isize) as *mut DXGK_SEGMENTDESCRIPTOR4) };
 
                     let (shmem_start, shmem_len) = state.queue_handler.get_shmem_slice();
+                    let host3d_budget = state.queue_handler.host3d_budget();
 
                     for segment in MemorySegment::SEGMENTS {
                         let desc = unsafe { &mut *(segment_info.pSegmentDescriptor.offset((segment_info.SegmentDescriptorStride * segment.index() as u64) as isize) as *mut DXGK_SEGMENTDESCRIPTOR4) };
-                        segment.fill_desc4(shmem_start, shmem_len, desc);
+                        segment.fill_desc4(shmem_start, shmem_len, host3d_budget, desc);
                     }
                 }
 

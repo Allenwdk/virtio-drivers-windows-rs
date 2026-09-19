@@ -1603,6 +1603,8 @@ impl FenceSubmission {
 struct GpuData {
     guest_alloc_supported: bool,
     boot_pool: Option<crate::boot_pool::BootPool>,
+    /// BlobHost3D segment size (DROIDVM_VRAM_BUDGET), or HOST3D_DEFAULT.
+    host3d_budget: u64,
     pub interface: DxgkInterface,
     pub shmem: VirtioCapabilityInfo,
 
@@ -1619,12 +1621,13 @@ struct GpuData {
 }
 
 impl GpuData {
-    fn new(interface: DxgkInterface, shmem: VirtioCapabilityInfo, boot_pool: Option<crate::boot_pool::BootPool>, guest_alloc_supported: bool) -> impl Init<Self, NtStatus> {
+    fn new(interface: DxgkInterface, shmem: VirtioCapabilityInfo, boot_pool: Option<crate::boot_pool::BootPool>, host3d_budget: u64, guest_alloc_supported: bool) -> impl Init<Self, NtStatus> {
         let shmem_pages = (shmem.length / (PAGE_SIZE as u64)) as u32;
 
         init!(Self {
             guest_alloc_supported,
             boot_pool,
+            host3d_budget,
             interface,
             shmem,
             resource_id: SimpleIdAllocator::new(1),
@@ -2503,12 +2506,27 @@ impl QueueHandler {
                 crate::bringup::record("BootPoolSizeLow", size as u32);
                 Some(pool)
             } else { None };
+            let host3d_budget = if negotiated_features.contains(Features::DROIDVM_VRAM_BUDGET) {
+                let read_u64 = |offset| crate::boot_pool::read_config_u64(offset, |word_offset| {
+                    pci_transport.read_config_space::<u32>(word_offset)
+                });
+                let magic = map_virtio_error!(read_u64(48))?;
+                let bytes = map_virtio_error!(read_u64(56))?;
+                if magic != u64::from_le_bytes(*b"DVMVRAM1") || bytes < (256u64 << 20) || bytes & ((1 << 20) - 1) != 0 {
+                    return Err(NtStatus(STATUS::DEVICE_CONFIGURATION_ERROR));
+                }
+                crate::bringup::record("VramBudgetMiB", (bytes >> 20) as u32);
+                bytes
+            } else {
+                crate::bringup::record("VramBudgetMiB", 0);
+                crate::process::MemorySegment::HOST3D_DEFAULT
+            };
             Ok(init!(Self {
                 control <- ControlQueue::new(&mut pci_transport, access_platform, indirect, event_idx),
                 cursor <- CursorQueue::new(&mut pci_transport, access_platform, indirect, event_idx),
                 pci_transport: pci_transport,
                 thread: Box::try_pin_init(Thread::new())?,
-                data: Arc::try_init(GpuData::new(interface, shmem, boot_pool, negotiated_features.contains(Features::CREATE_GUEST_HANDLE)))?,
+                data: Arc::try_init(GpuData::new(interface, shmem, boot_pool, host3d_budget, negotiated_features.contains(Features::CREATE_GUEST_HANDLE)))?,
                 chan: GpuChannel {
                     control: control.chan.clone(),
                     cursor: cursor.chan.clone(),
@@ -2536,6 +2554,10 @@ impl QueueHandler {
         let phys = self.data.interface.get_physical_bar_address(self.data.shmem.bar).unwrap() + self.data.shmem.offset;
         let size = self.data.shmem.length;
         (phys, size)
+    }
+
+    pub fn host3d_budget(&self) -> u64 {
+        self.data.host3d_budget
     }
 
     pub fn boot_pool(&self) -> Option<crate::boot_pool::BootPool> {
