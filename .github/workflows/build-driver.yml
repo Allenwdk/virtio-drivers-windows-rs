@@ -2,15 +2,21 @@ name: Build virtio_wddm_rs (arm64)
 
 # 构建 Windows GPU 内核驱动 virtio_wddm_rs.sys（ARM64）。
 #
-# windows-2025 runner 自带的 Windows SDK 不含内核组件（Include\<ver>\km、
-# Lib\<ver>\km\arm64），而编译 KMD 必须要有它们，所以这里先用 winget 装上
-# 与 runner SDK 同 build 号的 WDK。
+# 这里不改动任何源码，只把构建环境准备好：
 #
-# 之后把 util/ewdk 需要的四个路径写进仓库根的 ewdk.env：上游
-# util/ewdk/src/lib.rs 通过 `bash -c "source ../ewdk.env; ..."` 读取它，
-# GitHub 的 windows runner 上 PATH 里的 bash 是 Git Bash，source 能正常
-# 工作（Windows 本地默认的 C:\Windows\System32\bash.exe 是 WSL 启动器，
-# source 出来的变量传不回调用方，所以本地要另配环境变量）。
+# 1. windows-2025 runner 自带的 Windows SDK 不含内核组件
+#    （Include\<ver>\km、Lib\<ver>\km\arm64），所以先用 winget 装上与 runner
+#    SDK 同 build 号的 WDK。
+#
+# 2. util/ewdk 从 ewdk.env 取四个路径（`bash -c "source ../ewdk.env;
+#    source ../../ewdk.env; ..."`）。三个 crate 的 build script 深度不同：
+#    wdk/ 和 gpu-wddm/ 的 ../ 就是仓库根，而 util/microseh/ 的 ../ 是 util/。
+#    只要有一次 source 落空，GitHub runner 上的 Git Bash 就会以非 0 退出，
+#    于是 Option::unwrap 直接 panic，所以在仓库根和 util/ 各放一份。
+#
+# 3. util/ewdk 在 vfs 模式下把 include 路径写成 /winsys/sdk/...（上游是给
+#    Linux 上的 clang-cl 配 generate_vfs.py 用的），所以 vfs-overlay.json
+#    必须真的把 /winsys/sdk 映射到本机的 Windows Kits 目录，不能是空文件。
 
 on:
   workflow_dispatch:
@@ -39,10 +45,7 @@ jobs:
           $sdkVer = Get-ChildItem "$sdkRoot\Include" -Directory |
                     Where-Object { $_.Name -match '^10\.0\.\d+\.\d+$' } |
                     Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $sdkVer) {
-            Get-ChildItem "$sdkRoot\Include" -Directory -ErrorAction SilentlyContinue | Select-Object Name
-            throw "No Windows SDK version directory under $sdkRoot\Include"
-          }
+          if (-not $sdkVer) { throw "No Windows SDK version directory under $sdkRoot\Include" }
           $ver = $sdkVer.Name
           Write-Host "runner SDK version = $ver"
 
@@ -50,7 +53,6 @@ jobs:
           if (Test-Path $kmHeader) {
             Write-Host "WDK kernel headers already present, skipping install"
           } else {
-            # winget 包 ID 跟随 SDK 的 build 号：10.0.26100.0 -> Microsoft.WindowsWDK.10.0.26100
             $build = ($ver -split '\.')[2]
             $pkgId = "Microsoft.WindowsWDK.10.0.$build"
             Write-Host "installing $pkgId ..."
@@ -60,14 +62,11 @@ jobs:
           }
 
           if (-not (Test-Path $kmHeader)) {
-            Write-Host "--- contents of $sdkRoot\Include\$ver ---"
             Get-ChildItem "$sdkRoot\Include\$ver" -Directory -ErrorAction SilentlyContinue | Select-Object Name
             throw "WDK kernel headers missing: $kmHeader"
           }
-
           $kmLib = "$sdkRoot\Lib\$ver\km\arm64\ntoskrnl.lib"
           if (-not (Test-Path $kmLib)) {
-            Write-Host "--- contents of $sdkRoot\Lib\$ver ---"
             Get-ChildItem "$sdkRoot\Lib\$ver" -Directory -ErrorAction SilentlyContinue | Select-Object Name
             throw "WDK arm64 kernel libs missing: $kmLib"
           }
@@ -79,7 +78,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $sdkRoot = "${env:ProgramFiles(x86)}\Windows Kits\10"
+          $sdkRootFwd = "${env:ProgramFiles(x86)}\Windows Kits\10".Replace('\','/')
           $root = $PWD.Path.Replace('\','/')
 
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -94,36 +93,61 @@ jobs:
           $llvm = "$vs\VC\Tools\Llvm\x64\bin"
           if (Test-Path $llvm) { $llvm >> $env:GITHUB_PATH }
 
-          # util/ewdk 固定传 -vfsoverlay，所以这个文件必须存在。上游是在
-          # Linux 上用 clang-cl-linux 的 generate_vfs.py 生成路径映射用的，
-          # 在 Windows 上原生 clang-cl 不需要映射，空 overlay 即可。
-          $overlay = '{"version": 0, "case-sensitive": false, "roots": []}'
-          [System.IO.File]::WriteAllText("$root/vfs-overlay.json", $overlay)
+          $overlayLines = @(
+            '{',
+            '  "version": 0,',
+            '  "case-sensitive": false,',
+            '  "roots": [',
+            '    {',
+            '      "name": "/winsys/sdk",',
+            '      "type": "directory",',
+            '      "contents": [',
+            '        {',
+            '          "name": "Include",',
+            '          "type": "directory",',
+            '          "external-contents": "' + $sdkRootFwd + '/Include"',
+            '        }',
+            '      ]',
+            '    }',
+            '  ]',
+            '}'
+          )
+          [System.IO.File]::WriteAllText("$root/vfs-overlay.json", ($overlayLines -join "`n") + "`n")
 
-          # 必须写成 LF：bash source 时 CRLF 会把 \r 留在变量值里。
           $envLines = @(
             '#!/bin/bash',
             "export VCTOOLSVER=`"$($msvc.Name)`"",
             "export VCTOOLSDIR=`"$($msvc.FullName.Replace('\','/'))`"",
             "export WINSDKVER=`"$env:WINSDKVER`"",
-            "export WINSDKDIR=`"$($sdkRoot.Replace('\','/'))`"",
+            "export WINSDKDIR=`"$sdkRootFwd`"",
             "export VFSOVERLAY=`"$root/vfs-overlay.json`""
           )
-          [System.IO.File]::WriteAllText("$root/ewdk.env", ($envLines -join "`n") + "`n")
+          # 必须 LF：bash source 时 CRLF 会把 \r 带进变量值。
+          $envText = ($envLines -join "`n") + "`n"
+          [System.IO.File]::WriteAllText("$root/ewdk.env", $envText)
+          [System.IO.File]::WriteAllText("$root/util/ewdk.env", $envText)
 
           Write-Host "--- ewdk.env ---"
           Get-Content "$root/ewdk.env"
+          Write-Host "--- vfs-overlay.json ---"
+          Get-Content "$root/vfs-overlay.json"
           Write-Host "MSVC = $($msvc.Name)"
           Write-Host "LLVM = $llvm (exists: $(Test-Path $llvm))"
 
-      - name: Verify ewdk.env is readable from bash
+      - name: Verify ewdk.env from bash at every build-script depth
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           Write-Host "bash = $((Get-Command bash).Source)"
-          Push-Location gpu-wddm
-          bash -c 'source ../ewdk.env; echo "WINSDKDIR=$WINSDKDIR"; echo "WINSDKVER=$WINSDKVER"; echo "VCTOOLSDIR=$VCTOOLSDIR"; echo "VFSOVERLAY=$VFSOVERLAY"'
-          Pop-Location
+          foreach ($d in @('wdk','gpu-wddm','util/microseh')) {
+            Push-Location $d
+            $o = & bash -c 'source ../ewdk.env; source ../../ewdk.env; echo $VCTOOLSDIR; echo $WINSDKDIR; echo $WINSDKVER; echo $VFSOVERLAY' 2>&1
+            $code = $LASTEXITCODE
+            Pop-Location
+            Write-Host "=== $d -> exit=$code ==="
+            $o | ForEach-Object { Write-Host "| $_" }
+            if ($code -ne 0) { throw "bash failed in $d" }
+          }
 
       - name: Build driver (release)
         run: cargo +nightly build --package virtio-gpu-wddm-rs --target aarch64-pc-windows-msvc --release
