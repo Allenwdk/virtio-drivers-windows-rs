@@ -371,20 +371,34 @@ impl Command {
     pub fn attach_backing(chan: &GpuChannel, res_id: NonZero<u32>, mdl: MdlRef, offset: usize, n_pages: usize, dma: &mut [u8]) -> Self {
         const HEADER_SIZE: usize = size_of::<commands::ResourceAttachBacking>();
 
+        // dxgkrnl 传入的 MdlOffset/NumberOfPages 是它自己算出来的，可能超出这个
+        // MDL 在 offset 之后的实际页数。原来的实现仍按请求值声明 nr_entries，
+        // 而填充循环用 `take(n_pages)` —— 页数不足时循环会提前结束，尾部槽位保留
+        // DMA 缓冲里的残留数据。宿主会把这些脏数据当作有效映射读走，表现为 GPU
+        // 访问非法地址（Skipped access check / CP AHB bus error），进而 KGSL 提交
+        // 被拒（GPU_COMMAND Invalid argument），guest 侧应用冻结、vCPU 空转。
+        // 声明量必须等于实际填充量。
+        let avail = mdl.physical_pages().len().saturating_sub(offset);
+        let nr_entries = n_pages.min(avail);
+        if nr_entries != n_pages {
+            error!("{}: MDL shorter than requested: offset={} n_pages={} avail={} -> nr_entries={}",
+                   function!(), offset, n_pages, avail, nr_entries);
+        }
+
         let hdr = commands::ResourceAttachBacking {
             header: chan.new_header(commands::Command::RESOURCE_ATTACH_BACKING, true, None, None),
             resource_id: res_id.get(),
-            nr_entries: n_pages as _,
+            nr_entries: nr_entries as _,
         };
 
-        let body_size = n_pages * size_of::<commands::MemEntry>();
+        let body_size = nr_entries * size_of::<commands::MemEntry>();
         let dma = &mut dma[..HEADER_SIZE+body_size];
         let (hdr_dma, body_dma) = dma.split_at_mut(HEADER_SIZE);
         hdr.write_to_prefix(hdr_dma).unwrap();
 
         let entries = unsafe {
             let addr = transmute::<_, *mut commands::MemEntry>(body_dma.as_mut_ptr());
-            slice_from_raw_parts_mut(addr, n_pages)
+            slice_from_raw_parts_mut(addr, nr_entries)
         };
 
         // physical_pages() covers the whole MDL, while this command describes only
@@ -392,7 +406,7 @@ impl Command {
         // the entry array: `entries` is a checked slice, so a longer MDL would
         // otherwise panic in the paging path instead of just sending a short list.
         let phys_pages = &mdl.physical_pages()[offset..];
-        for (i, phys_page) in phys_pages.iter().take(n_pages).enumerate() {
+        for (i, phys_page) in phys_pages.iter().take(nr_entries).enumerate() {
             entries[i] = commands::MemEntry {
                 addr: phys_page * (PAGE_SIZE as u64),
                 length: PAGE_SIZE,
