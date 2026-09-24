@@ -193,14 +193,17 @@ jobs:
             throw "diagnostic patch anchor not found; lib.rs changed"
           }
 
-          $replacement = @'
-                  .output()
-                  .inspect(|o| eprintln!("EWDK-DIAG status={:?} stdout=[{}] stderr=[{}]",
-                      o.status,
-                      String::from_utf8_lossy(&o.stdout),
-                      String::from_utf8_lossy(&o.stderr)))
-                  .ok()
-'@
+          # 注意：这里不能用 here-string。PowerShell 要求 `'@` 终止符顶格，
+          # 而 YAML 的块标量又要求所有行保持缩进 ≥ 10 空格，两者冲突会让
+          # 整个 workflow 解析失败（run 直接不执行）。用数组拼换行符。
+          $replacement = @(
+            '        .output()',
+            '        .inspect(|o| eprintln!("EWDK-DIAG status={:?} stdout=[{}] stderr=[{}]",',
+            '            o.status,',
+            '            String::from_utf8_lossy(&o.stdout),',
+            '            String::from_utf8_lossy(&o.stderr)))',
+            '        .ok()'
+          ) -join "`n"
           $c = $c.Replace($needle, $replacement)
           [System.IO.File]::WriteAllText((Resolve-Path $f), $c)
           Write-Host "=== patched section ==="
