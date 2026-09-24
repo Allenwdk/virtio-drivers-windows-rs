@@ -142,8 +142,9 @@ jobs:
           # 和 usr\bin 前置到 PATH 最前面，确保解析到 Git Bash。
           $gitBash = "C:\Program Files\Git\bin\bash.exe"
           if (-not (Test-Path $gitBash)) { throw "Git Bash not found at $gitBash" }
+          # 只前置 Git\bin：它是官方 wrapper，会初始化 MSYS 环境；直接跑
+          # usr\bin\bash.exe 在原生 Windows 进程下发起的场景行为不一致。
           "C:/Program Files/Git/bin"     >> $env:GITHUB_PATH
-          "C:/Program Files/Git/usr/bin" >> $env:GITHUB_PATH
 
       - name: Verify bash resolution and ewdk.env at every build-script depth
         shell: pwsh
@@ -174,6 +175,44 @@ jobs:
             $o | ForEach-Object { Write-Host "| $_" }
             if ($code -ne 0) { throw "bash failed in $d" }
           }
+
+      - name: Reveal what the ewdk crate actually gets from bash
+        shell: pwsh
+        run: |
+          # util/ewdk 的 `bash -c ...` 链条只保留了 stdout，stderr 被丢掉，
+          # 失败时只看得到一句 unwrap panic。这里在 **运行期**（不写回仓库）
+          # 给 lib.rs 打一个打印补丁，把 status / stderr / stdout 全暴露出来。
+          $ErrorActionPreference = "Stop"
+          $f = "util/ewdk/src/lib.rs"
+          $c = Get-Content $f -Raw
+
+          $needle = "        .output()`n        .ok()"
+          if (-not $c.Contains($needle)) {
+            Write-Host "=== lib.rs around .output() ==="
+            ($c -split "`n" | Select-String -Pattern 'output|bash|ewdk.env' -Context 2,2) | Out-String
+            throw "diagnostic patch anchor not found; lib.rs changed"
+          }
+
+          $replacement = @'
+                  .output()
+                  .inspect(|o| eprintln!("EWDK-DIAG status={:?} stdout=[{}] stderr=[{}]",
+                      o.status,
+                      String::from_utf8_lossy(&o.stdout),
+                      String::from_utf8_lossy(&o.stderr)))
+                  .ok()
+'@
+          $c = $c.Replace($needle, $replacement)
+          [System.IO.File]::WriteAllText((Resolve-Path $f), $c)
+          Write-Host "=== patched section ==="
+          Get-Content $f | Select-String -Pattern "EWDK-DIAG" -Context 3,3 | Out-String
+
+      - name: Where does cargo's PATH find bash
+        shell: pwsh
+        run: |
+          Write-Host "where.exe bash:"
+          where.exe bash 2>&1 | ForEach-Object { Write-Host "| $_" }
+          Write-Host "Get-Command bash: $((Get-Command bash -ErrorAction SilentlyContinue).Source)"
+          Write-Host "PATHEXT = $env:PATHEXT"
 
       - name: Build driver (release)
         run: cargo +nightly build --package virtio-gpu-wddm-rs --target aarch64-pc-windows-msvc --release
