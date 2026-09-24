@@ -134,11 +134,37 @@ jobs:
           Write-Host "MSVC = $($msvc.Name)"
           Write-Host "LLVM = $llvm (exists: $(Test-Path $llvm))"
 
-      - name: Verify ewdk.env from bash at every build-script depth
+          # 关键：util/ewdk 是用 Command::new("bash") 拉起 bash 的，而 Cargo /
+          # rustc 是原生 Windows 程序，按 Windows 的 PATH 搜索，不走 Git Bash
+          # 的 /usr/bin。Git 的 bash.exe 在 Git\bin，默认不在 Windows PATH 上，
+          # 于是会命中 C:\Windows\System32\bash.exe（WSL 启动器）——runner 上没装
+          # WSL 发行版，它起不来，lines 为空，unwrap 直接 panic。把 Git 的 bin
+          # 和 usr\bin 前置到 PATH 最前面，确保解析到 Git Bash。
+          $gitBash = "C:\Program Files\Git\bin\bash.exe"
+          if (-not (Test-Path $gitBash)) { throw "Git Bash not found at $gitBash" }
+          "C:/Program Files/Git/bin"     >> $env:GITHUB_PATH
+          "C:/Program Files/Git/usr/bin" >> $env:GITHUB_PATH
+
+      - name: Verify bash resolution and ewdk.env at every build-script depth
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          Write-Host "bash = $((Get-Command bash).Source)"
+
+          # 在**真实的 Windows PATH** 上确认 Command::new("bash") 会解析到谁。
+          # pwsh 的 Get-Command 会看 PowerShell 自己的解析规则，可能骗人，
+          # 这里直接按 PATH 逐项找 bash.exe。
+          $resolved = $null
+          foreach ($p in $env:PATH -split ';') {
+            if ([string]::IsNullOrWhiteSpace($p)) { continue }
+            $candidate = Join-Path $p 'bash.exe'
+            if (Test-Path $candidate) { $resolved = $candidate; break }
+          }
+          Write-Host "Command::new('bash') would resolve to: $resolved"
+          if (-not $resolved) { throw "no bash.exe found on PATH" }
+          if ($resolved -like '*System32*') {
+            throw "PATH still resolves bash to the WSL launcher: $resolved"
+          }
+
           foreach ($d in @('wdk','gpu-wddm','util/microseh')) {
             Push-Location $d
             $o = & bash -c 'source ../ewdk.env; source ../../ewdk.env; echo $VCTOOLSDIR; echo $WINSDKDIR; echo $WINSDKVER; echo $VFSOVERLAY' 2>&1
