@@ -184,7 +184,11 @@ jobs:
           # 给 lib.rs 打一个打印补丁，把 status / stderr / stdout 全暴露出来。
           $ErrorActionPreference = "Stop"
           $f = "util/ewdk/src/lib.rs"
-          $c = Get-Content $f -Raw
+
+          # Windows 上 checkout 出来的 .rs 是 CRLF 行尾，直接按 `\n` 拼的锚点
+          # 匹配不到（上一版就是这么把自己 throw 掉的）。先归一化成 LF 再处理，
+          # 写回也保持 LF —— cargo 对 .rs 的行尾没有要求。
+          $c = (Get-Content $f -Raw) -replace "`r`n", "`n"
 
           $needle = "        .output()`n        .ok()"
           if (-not $c.Contains($needle)) {
